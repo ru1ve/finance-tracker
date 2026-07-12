@@ -3,13 +3,12 @@ app.py — Personal Finance Tracker
 Tkinter + Matplotlib UI over SQLite backend.
 
 Tabs:
-  1. Dashboard      — current balances, totals, interest summary
+  1. Dashboard      — balances, totals, account management (add/edit/deactivate)
   2. Snapshot       — log a new balance snapshot for all accounts
   3. History        — charts of account / category history over time
   4. Categories     — spending allocation breakdown over time
   5. Interest       — current interest summary + forward projection
   6. Mortgage       — affordability estimator
-  7. Accounts       — add / edit accounts, manage rates & allocations
 """
 
 import tkinter as tk
@@ -69,6 +68,26 @@ def fmt_gbp(v):
 def fmt_pct(v):
     if v is None: return "—"
     return f"{v*100:.2f}%"
+
+_DATE_FORMATS = {
+    "YYYY-MM-DD":  "%Y-%m-%d",
+    "DD/MM/YYYY":  "%d/%m/%Y",
+    "DD Mon YYYY": "%d %b %Y",
+    "MM/DD/YYYY":  "%m/%d/%Y",
+}
+
+def format_date(date_str):
+    """Display a stored date string using the user-configured date format."""
+    if not date_str or date_str == "—":
+        return date_str
+    fmt_key = db.get_setting("date_format", "YYYY-MM-DD")
+    out_fmt  = _DATE_FORMATS.get(fmt_key, "%Y-%m-%d")
+    for parse_fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(str(date_str), parse_fmt).strftime(out_fmt)
+        except ValueError:
+            pass
+    return date_str
 
 
 # ---------------------------------------------------------------------------
@@ -134,86 +153,399 @@ def embed_figure(parent, fig):
 class DashboardTab(tk.Frame):
     def __init__(self, parent):
         super().__init__(parent, bg=BG)
+        self._selected_id     = None
+        self._selected_active = True
         self._build()
 
     def _build(self):
-        # Header row
+        # Header
         hdr = styled_frame(self)
         hdr.pack(fill="x", padx=20, pady=(16, 4))
         styled_label(hdr, "Dashboard", font=STYLE["font_h1"]).pack(side="left")
-        styled_button(hdr, "⟳ Refresh", self.refresh, color=GREEN).pack(side="right")
+        self._toggle_btn = styled_button(hdr, "⊗ Deactivate", self._deactivate, color=RED)
+        self._toggle_btn.pack(side="right")
+        styled_button(hdr, "⟳ Refresh", self.refresh, color=GREEN).pack(side="right", padx=8)
+        styled_button(hdr, "+ Add Account", self._add_account, color=GREEN).pack(side="right", padx=8)
 
-        # Summary cards row
+        # Summary cards (main row)
         self.cards_frame = styled_frame(self)
-        self.cards_frame.pack(fill="x", padx=20, pady=8)
+        self.cards_frame.pack(fill="x", padx=20, pady=(4, 2))
 
-        # Treeview — current balances
-        section_label(self, "  Current Balances").pack(fill="x", padx=20, pady=(8, 2))
+        # Category allocation cards (second row)
+        self.cat_cards_frame = styled_frame(self)
+        self.cat_cards_frame.pack(fill="x", padx=20, pady=(0, 6))
+
+        # Edit bar — single row
+        edit_bar = tk.Frame(self, bg=BG2)
+        edit_bar.pack(fill="x", padx=20, pady=(0, 6))
+
+        def _lbl(text):
+            return tk.Label(edit_bar, text=text, bg=BG2, fg=SUBTEXT, font=STYLE["font"])
+
+        def _ent(var, w):
+            return tk.Entry(edit_bar, textvariable=var, bg=BG3, fg=FG,
+                            insertbackground=FG, relief="flat",
+                            font=STYLE["font"], width=w)
+
+        self._sel_label = tk.Label(edit_bar, text="Select an account to edit",
+                                   bg=BG2, fg=SUBTEXT, font=STYLE["font"],
+                                   width=20, anchor="w")
+        self._sel_label.pack(side="left", padx=(10, 6), pady=6)
+
+        tk.Frame(edit_bar, bg=BG3, width=1).pack(side="left", fill="y", pady=4)
+
+        _lbl("Bank:").pack(side="left", padx=(8, 3))
+        self._bank_var = tk.StringVar()
+        _ent(self._bank_var, 12).pack(side="left", padx=(0, 8))
+
+        _lbl("Label:").pack(side="left", padx=(0, 3))
+        self._actype_var = tk.StringVar()
+        _ent(self._actype_var, 12).pack(side="left", padx=(0, 8))
+
+        _lbl("Type:").pack(side="left", padx=(0, 3))
+        self._pt_var = tk.StringVar()
+        self._pt_combo = ttk.Combobox(edit_bar, textvariable=self._pt_var, width=14,
+                                       font=STYLE["font"], state="normal")
+        self._pt_combo["values"] = db.get_product_types()
+        self._pt_combo.pack(side="left", padx=(0, 8))
+
+        _lbl("Rate Max £:").pack(side="left", padx=(0, 3))
+        self._maxbal_var = tk.StringVar()
+        _ent(self._maxbal_var, 10).pack(side="left", padx=(0, 8))
+
+        styled_button(edit_bar, "Save", self._save_edits, color=GREEN).pack(side="left")
+
+        tk.Label(edit_bar, text="Rates & allocations → Log Snapshot",
+                 bg=BG2, fg=SUBTEXT, font=STYLE["font"]).pack(side="right", padx=12)
+
+        # Tree
+        section_label(self, "  Current Balances").pack(fill="x", padx=20, pady=(4, 2))
         tree_frame = styled_frame(self)
         tree_frame.pack(fill="both", expand=True, padx=20, pady=(0, 16))
 
-        cols = ("bank", "account", "category", "balance", "rate", "yearly_int", "daily_int")
-        self.tree, sb = make_tree(tree_frame, cols, height=18)
-        headers = ("Bank", "Account", "Category", "Balance", "Rate", "Yearly Int", "Daily Int")
-        widths   = (120, 220, 130, 110, 70, 110, 90)
-        for col, hdr_text, w in zip(cols, headers, widths):
+        self._spend_cats = db.get_spending_category_names()
+        _cat_short = {"Spending": "Spending", "Deposit": "Deposit",
+                      "Emergency Fund": "Emerg. Fund", "Long Term Savings": "LT Savings",
+                      "Pension": "Pension"}
+        cat_cols = [c.lower().replace(" ", "_") for c in self._spend_cats]
+        cols = ("name", "bank", "product_type", "rate", "max_for_rate",
+                "balance", "yearly_int", "last_recorded") + tuple(cat_cols)
+        self.tree, sb = make_tree(tree_frame, cols, height=22)
+        fixed_defs = [
+            ("name",          "Account Name",  175, "w"),
+            ("bank",          "Bank",           90, "w"),
+            ("product_type",  "Type",           110, "w"),
+            ("rate",          "Rate %",          68, "e"),
+            ("max_for_rate",  "Rate Max £",      95, "e"),
+            ("balance",       "Balance",         100, "e"),
+            ("yearly_int",    "Yr. Interest",    95, "e"),
+            ("last_recorded", "Last Recorded",   100, "e"),
+        ]
+        for col, hdr_text, w, anch in fixed_defs + [
+            (c, _cat_short.get(n, n), 78, "e")
+            for c, n in zip(cat_cols, self._spend_cats)
+        ]:
             self.tree.heading(col, text=hdr_text)
-            self.tree.column(col, width=w, anchor="e" if col in ("balance","rate","yearly_int","daily_int") else "w")
-
+            self.tree.column(col, width=w, anchor=anch)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.tag_configure("inactive", foreground=SUBTEXT)
 
         self.refresh()
 
-    def _make_card(self, parent, label, value, colour):
-        f = tk.Frame(parent, bg=BG3, padx=16, pady=12)
-        tk.Label(f, text=label, bg=BG3, fg=SUBTEXT, font=STYLE["font"]).pack(anchor="w")
+    def _make_card(self, parent, label, value, colour, subtitle=None, subtitle_colour=None):
+        f = tk.Frame(parent, bg=BG3, padx=16, pady=10)
+        # Invisible spacer enforces a minimum card width
+        tk.Frame(f, bg=BG3, width=170, height=1).pack()
+        tk.Label(f, text=label, bg=BG3, fg=SUBTEXT, font=STYLE["font"],
+                 anchor="w").pack(fill="x")
         tk.Label(f, text=value, bg=BG3, fg=colour,
-                 font=("Segoe UI", 18, "bold")).pack(anchor="w")
+                 font=("Segoe UI", 16, "bold"), anchor="w").pack(fill="x")
+        # Always render the subtitle row so all cards share the same height
+        sub_text   = subtitle or ""
+        sub_colour = subtitle_colour if subtitle else BG3  # invisible when empty
+        tk.Label(f, text=sub_text, bg=BG3, fg=sub_colour,
+                 font=STYLE["font"], anchor="w").pack(fill="x", pady=(2, 0))
         return f
 
+
+    def _mom_sub(self, history, current_val):
+        """Return (subtitle_text, subtitle_colour) for a card, or (None, None)."""
+        pct, gbp = self._mom_change_from(history, current_val)
+        if pct is None:
+            return None, None
+        arrow  = "↑" if gbp >= 0 else "↓"
+        sign   = "+" if gbp >= 0 else ""
+        colour = GREEN if gbp >= 0 else RED
+        return f"{arrow} {abs(pct):.2f}%  {sign}{fmt_gbp(gbp)}  vs 1 mo", colour
+
+    def _mom_change_from(self, history, current_val: float):
+        """_mom_change() generalised to accept any pre-fetched history list."""
+        if not history:
+            return None, None
+        today     = datetime.date.today()
+        target    = today - datetime.timedelta(days=30)
+        today_str = today.isoformat()
+
+        def _d(s): return datetime.date.fromisoformat(s[:10])
+
+        series = list(history)
+        if not series or series[-1][0][:10] < today_str:
+            series.append((today_str, current_val))
+
+        if _d(series[0][0]) > target:
+            if len(series) < 2:
+                return None, None
+            d0, v0 = series[0]
+            d1, v1 = series[1]
+            span = (_d(d1) - _d(d0)).days
+            if span == 0:
+                return None, None
+            slope = (v1 - v0) / span
+            target_val = v0 - slope * (_d(d0) - target).days
+        else:
+            before = [(d, v) for d, v in series if _d(d) <= target]
+            after  = [(d, v) for d, v in series if _d(d) >= target]
+            if not before or not after:
+                return None, None
+            d0, v0 = before[-1]
+            d1, v1 = after[0]
+            if d0[:10] == d1[:10]:
+                target_val = v0
+            else:
+                span = (_d(d1) - _d(d0)).days
+                frac = (target - _d(d0)).days / span
+                target_val = v0 + frac * (v1 - v0)
+
+        if target_val == 0:
+            return None, None
+        delta_gbp = current_val - target_val
+        return delta_gbp / abs(target_val) * 100, delta_gbp
+
     def refresh(self):
-        # Clear cards
+        sel = self._selected_id
         for w in self.cards_frame.winfo_children():
             w.destroy()
+        for w in self.cat_cards_frame.winfo_children():
+            w.destroy()
 
-        summary = db.get_current_interest_summary()
-        date_str, snapshot = db.get_latest_snapshot()
+        summary     = db.get_current_interest_summary()
+        date_str, _ = db.get_latest_snapshot()
 
-        total_balance = sum(r["balance"] for r in summary)
+        total_balance  = sum(r["balance"] for r in summary)
         total_interest = sum(r["yearly_interest"] for r in summary)
-        total_debt = sum(r["balance"] for r in summary if r["balance"] < 0)
-        net = total_balance - abs(total_debt) if total_debt else total_balance
+        total_debt     = sum(r["balance"] for r in summary if r["balance"] < 0)
+        net            = total_balance - abs(total_debt) if total_debt else total_balance
 
-        cards = [
-            ("Total Assets", fmt_gbp(total_balance), GREEN),
-            ("Total Debt",   fmt_gbp(abs(total_debt)), RED),
-            ("Net Worth",    fmt_gbp(net), ACCENT),
-            ("Yearly Interest", fmt_gbp(total_interest), YELLOW),
-            ("Last Snapshot", date_str or "None", SUBTEXT),
+        # Fetch histories for MoM calculations (one DB call each)
+        assets_hist = db.get_assets_history()     # positive balances
+        debt_hist   = db.get_debt_history()       # negative balances (values are negative)
+        nw_hist     = db.get_net_worth_history()  # total (used for Net Worth card)
+
+        # Main summary cards
+        card_defs = [
+            ("Total Assets",    fmt_gbp(total_balance),    GREEN,  assets_hist,  total_balance),
+            ("Total Debt",      fmt_gbp(abs(total_debt)),  RED,    [(d, abs(v)) for d, v in debt_hist], abs(total_debt)),
+            ("Net Worth",       fmt_gbp(net),              ACCENT, nw_hist,      net),
+            ("Yearly Interest", fmt_gbp(total_interest),   YELLOW, None,         None),
+            ("Last Snapshot",   format_date(date_str) if date_str else "None", SUBTEXT, None, None),
         ]
-        for label, val, colour in cards:
-            c = self._make_card(self.cards_frame, label, val, colour)
-            c.pack(side="left", padx=(0, 12), pady=4)
+        for label, val, colour, hist, cur in card_defs:
+            sub, sub_col = self._mom_sub(hist, cur) if hist is not None else (None, None)
+            self._make_card(self.cards_frame, label, val, colour,
+                            subtitle=sub, subtitle_colour=sub_col).pack(
+                side="left", padx=(0, 10), pady=4)
 
-        # Populate tree
+        # Category allocation cards — use same logic as CategoriesTab via get_category_history()
+        cat_history = db.get_category_history()
+        if cat_history:
+            cur_totals = cat_history[-1]["totals"]
+            cat_series: dict = {cat: [] for cat in self._spend_cats}
+            for entry in cat_history:
+                for cat in self._spend_cats:
+                    cat_series[cat].append((entry["date"], entry["totals"].get(cat, 0.0)))
+        else:
+            cur_totals = {cat: 0.0 for cat in self._spend_cats}
+            cat_series = {cat: [] for cat in self._spend_cats}
+
+        _cat_colours = {
+            "Spending":          MAUVE,
+            "Deposit":           ACCENT,
+            "Emergency Fund":    TEAL,
+            "Long Term Savings": GREEN,
+            "Pension":           YELLOW,
+        }
+        for cat in self._spend_cats:
+            cur_val      = cur_totals.get(cat, 0.0)
+            sub, sub_col = self._mom_sub(cat_series[cat], cur_val)
+            colour       = _cat_colours.get(cat, FG)
+            self._make_card(self.cat_cards_frame, cat, fmt_gbp(cur_val), colour,
+                            subtitle=sub, subtitle_colour=sub_col).pack(
+                side="left", padx=(0, 10), pady=4)
+
+        # Tree rows
         for row in self.tree.get_children():
             self.tree.delete(row)
 
-        for r in summary:
-            colour_tag = "pos" if r["balance"] >= 0 else "neg"
-            self.tree.insert("", "end", values=(
-                r["bank"] or "",
-                r["account_name"],
-                r["category"] or "",
-                fmt_gbp(r["balance"]),
-                fmt_pct(r["rate"]),
-                fmt_gbp(r["yearly_interest"]),
-                f"£{r['daily_interest']:.4f}",
-            ), tags=(colour_tag,))
+        today      = datetime.date.today().isoformat()
+        all_accs   = db.get_all_accounts(include_inactive=True)
+        snapshot   = db.get_latest_balance_per_account()
+        last_dates = db.get_last_recorded_dates()
+        rates      = db._get_rates_on_date(today)
+        allocs     = db.get_all_allocations_on_date(today)
 
-        self.tree.tag_configure("pos", foreground=FG)
-        self.tree.tag_configure("neg", foreground=RED)
+        yearly_int = {
+            acc["id"]: max(0.0, snapshot.get(acc["id"], 0.0)) * rates.get(acc["id"], 0.0)
+            for acc in all_accs
+        }
+
+        active   = [a for a in all_accs if a["is_active"]]
+        inactive = [a for a in all_accs if not a["is_active"]]
+
+        for acc in active:
+            self._insert_row(acc, snapshot, rates, last_dates, allocs, yearly_int, tag="active")
+
+        if inactive:
+            n_cols = 8 + len(self._spend_cats)
+            self.tree.insert("", "end", iid="__sep__",
+                             values=("── Deactivated ──",) + ("",) * (n_cols - 1),
+                             tags=("sep",))
+            self.tree.tag_configure("sep", foreground=SUBTEXT)
+            for acc in inactive:
+                self._insert_row(acc, snapshot, rates, last_dates, allocs, yearly_int,
+                                 tag="inactive")
+
+        if sel and self.tree.exists(str(sel)):
+            self.tree.selection_set(str(sel))
+
+    def _insert_row(self, acc, snapshot, rates, last_dates, allocs, yearly_int, tag):
+        acc_id     = acc["id"]
+        rate       = rates.get(acc_id, 0.0)
+        balance    = snapshot.get(acc_id)
+        last_dt    = last_dates.get(acc_id)
+        acc_allocs = allocs.get(acc_id, {})
+        max_bal    = acc.get("max_balance_for_rate")
+        try:
+            max_bal = float(max_bal) if max_bal not in (None, "", "None") else None
+        except (TypeError, ValueError):
+            max_bal = None
+        yr_int     = yearly_int.get(acc_id, 0.0)
+
+        def _fmt_alloc(cat):
+            v = acc_allocs.get(cat, {"fixed": 0.0, "pct": 0.0})
+            if v["fixed"]:
+                return f"£{v['fixed']:,.2f}"
+            if v["pct"]:
+                return f"{v['pct']*100:.2f}%"
+            return "—"
+
+        cat_vals = tuple(_fmt_alloc(c) for c in self._spend_cats)
+        self.tree.insert("", "end", iid=str(acc_id), values=(
+            acc["account_name"],
+            acc.get("bank") or "—",
+            acc.get("product_type") or "—",
+            f"{rate * 100:.2f}%" if rate else "—",
+            fmt_gbp(max_bal) if max_bal else "—",
+            fmt_gbp(balance) if balance is not None else "—",
+            fmt_gbp(yr_int) if yr_int else "—",
+            format_date(last_dt) if last_dt else "—",
+        ) + cat_vals, tags=(tag,))
+
+    def _on_select(self, event):
+        sel = self.tree.selection()
+        if not sel or sel[0] == "__sep__":
+            return
+        self._selected_id = int(sel[0])
+        acc = db.get_account_by_id(self._selected_id)
+        self._selected_active = bool(acc["is_active"])
+        self._sel_label.config(text="Editing:", fg=ACCENT)
+        self._bank_var.set(acc.get("bank") or "")
+        self._actype_var.set(acc.get("account_type") or "")
+        self._pt_var.set(acc.get("product_type") or "")
+        mb = acc.get("max_balance_for_rate")
+        try:
+            mb = float(mb) if mb not in (None, "", "None") else None
+        except (TypeError, ValueError):
+            mb = None
+        self._maxbal_var.set(f"{mb:.2f}" if mb is not None else "")
+        if self._selected_active:
+            self._toggle_btn.config(text="⊗ Deactivate", fg=RED, command=self._deactivate)
+        else:
+            self._toggle_btn.config(text="↺ Reactivate", fg=GREEN, command=self._reactivate)
+
+    def _add_type_inline(self):
+        name = simpledialog.askstring("New Account Type",
+                                      "Enter new account type name:", parent=self)
+        if name and name.strip():
+            db.add_product_type(name.strip())
+            self._pt_combo["values"] = db.get_product_types()
+            self._pt_var.set(name.strip())
+
+    def _save_edits(self):
+        if not self._selected_id:
+            messagebox.showwarning("No selection", "Select an account first.")
+            return
+        bank   = self._bank_var.get().strip()
+        label  = self._actype_var.get().strip()
+        ptype  = self._pt_var.get().strip()
+        mb_raw = self._maxbal_var.get().strip().replace("£", "").replace(",", "")
+
+        if not bank and not label:
+            messagebox.showwarning("Validation", "Bank or label cannot both be blank.")
+            return
+        name = f"{bank} - {label}" if bank and label else (bank or label)
+        try:
+            max_bal = float(mb_raw) if mb_raw else None
+        except ValueError:
+            messagebox.showwarning("Validation", "Rate Max £ must be a number.")
+            return
+
+        if ptype and ptype not in db.get_product_types():
+            db.add_product_type(ptype)
+            self._pt_combo["values"] = db.get_product_types()
+
+        try:
+            db.update_account_details(self._selected_id, bank or None, label or None,
+                                      name, ptype or None, max_bal)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+            return
+        self.refresh()
+
+    def _deactivate(self):
+        if not self._selected_id:
+            messagebox.showwarning("No selection", "Select an account first.")
+            return
+        acc = db.get_account_by_id(self._selected_id)
+        if messagebox.askyesno("Confirm", f"Deactivate '{acc['account_name']}'?\n"
+                               "It will no longer appear in snapshots but history is kept."):
+            db.deactivate_account(self._selected_id)
+            self._clear_selection()
+            self.refresh()
+
+    def _reactivate(self):
+        if not self._selected_id:
+            return
+        acc = db.get_account_by_id(self._selected_id)
+        if messagebox.askyesno("Confirm", f"Reactivate '{acc['account_name']}'?\n"
+                               "It will appear in new snapshots again."):
+            db.reactivate_account(self._selected_id)
+            self._clear_selection()
+            self.refresh()
+
+    def _clear_selection(self):
+        self._selected_id     = None
+        self._selected_active = True
+        self._sel_label.config(text="Select an account to edit", fg=SUBTEXT)
+        self._bank_var.set("")
+        self._actype_var.set("")
+        self._pt_var.set("")
+        self._maxbal_var.set("")
+        self._toggle_btn.config(text="⊗ Deactivate", fg=RED, command=self._deactivate)
+
+    def _add_account(self):
+        AddAccountDialog(self, self.refresh)
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +582,13 @@ class SnapshotTab(tk.Frame):
         date_row = styled_frame(self)
         date_row.pack(fill="x", padx=20, pady=(4, 6))
         styled_label(date_row, "Date / time:").pack(side="left")
+        _dfmt = _DATE_FORMATS.get(db.get_setting("date_format", "YYYY-MM-DD"), "%Y-%m-%d")
         self.date_var = tk.StringVar(
-            value=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
-        styled_entry(date_row, width=18, textvariable=self.date_var).pack(side="left", padx=8)
+            value=datetime.datetime.now().strftime(f"{_dfmt} %H:%M"))
+        styled_entry(date_row, width=20, textvariable=self.date_var).pack(side="left", padx=8)
+        _dfmt_label = db.get_setting("date_format", "YYYY-MM-DD")
         styled_label(date_row,
-                     "(YYYY-MM-DD HH:MM)  ·  Category cells: £500 = fixed, 60% = remainder",
+                     f"({_dfmt_label} HH:MM)  ·  Category cells: £500 = fixed, 60% = remainder",
                      fg=SUBTEXT).pack(side="left")
 
         # ---- two-panel body ----
@@ -295,9 +629,12 @@ class SnapshotTab(tk.Frame):
     def _populate(self):
         for w in self.inner.winfo_children():
             w.destroy()
-        self._bal_vars  = {}
-        self._rate_vars = {}
-        self._cat_vars  = {}
+        self._bal_vars    = {}
+        self._rate_vars   = {}
+        self._cat_vars    = {}
+        self._bal_entries  = []
+        self._rate_entries = []
+        self._cat_entries  = {cat: [] for cat in self.CATS}
 
         self._accounts = db.get_all_accounts()
         prev           = db.get_latest_balance_per_account()   # most recent per account
@@ -358,26 +695,56 @@ class SnapshotTab(tk.Frame):
                      ).grid(row=grid_row, column=col, padx=1, sticky="ew")
             col += 1
 
-            # New balance entry
-            bal_var = tk.StringVar(value=f"") #{prev_bal:.2f}" if prev_bal is not None else
-            styled_entry(self.inner, width=13, textvariable=bal_var
-                         ).grid(row=grid_row, column=col, padx=1, pady=1)
-            self._bal_vars[acc_id] = bal_var
+            # New balance entry — focus-in autofills from previous balance if empty
+            bal_var   = tk.StringVar()
+            bal_entry = styled_entry(self.inner, width=13, textvariable=bal_var)
+            bal_entry.grid(row=grid_row, column=col, padx=1, pady=1)
+            self._bal_vars[acc_id]  = bal_var
+            self._bal_entries.append(bal_entry)
+
+            def _colour_entry(*_args, v=bal_var, pv=prev_bal, w=bal_entry):
+                raw = v.get().strip().replace("£", "").replace(",", "")
+                if not raw:
+                    w.config(bg=BG3)
+                    return
+                try:
+                    val = float(raw)
+                except ValueError:
+                    w.config(bg=BG3)
+                    return
+                if pv is None or val == pv:
+                    w.config(bg=BG3)
+                elif val > pv:
+                    w.config(bg="#1a3025")
+                else:
+                    w.config(bg="#3a1a20")
+            bal_var.trace_add("write", _colour_entry)
+
+            if prev_bal is not None:
+                def _autofill(e, v=bal_var, pv=prev_bal):
+                    if v.get() == "":
+                        v.set(f"{pv:.2f}")
+                        e.widget.after(0, lambda w=e.widget: (
+                            w.selection_range(0, tk.END),
+                            w.icursor(tk.END),
+                        ))
+                bal_entry.bind("<FocusIn>", _autofill)
             col += 1
 
             # Current rate (read-only)
             tk.Label(self.inner,
-                     text=f"{cur_rate*100:.4f}%" if cur_rate else "—",
+                     text=f"{cur_rate*100:.2f}%" if cur_rate else "—",
                      bg=row_bg, fg=SUBTEXT, font=STYLE["font_mono"],
                      width=9, anchor="e"
                      ).grid(row=grid_row, column=col, padx=1, sticky="ew")
             col += 1
 
             # New rate entry (blank = no change)
-            rate_var = tk.StringVar()
-            styled_entry(self.inner, width=10, textvariable=rate_var
-                         ).grid(row=grid_row, column=col, padx=1, pady=1)
-            self._rate_vars[acc_id] = rate_var
+            rate_var   = tk.StringVar()
+            rate_entry = styled_entry(self.inner, width=10, textvariable=rate_var)
+            rate_entry.grid(row=grid_row, column=col, padx=1, pady=1)
+            self._rate_vars[acc_id]  = rate_var
+            self._rate_entries.append(rate_entry)
             col += 1
 
             # Category cells — pre-filled with current allocation
@@ -387,14 +754,37 @@ class SnapshotTab(tk.Frame):
                 if current["fixed"]:
                     default = f"£{current['fixed']:.2f}"
                 elif current["pct"]:
-                    default = f"{current['pct']*100:.4f}%"
+                    default = f"{current['pct']*100:.2f}%"
                 else:
                     default = ""
-                var = tk.StringVar(value=default)
-                styled_entry(self.inner, width=11, textvariable=var
-                             ).grid(row=grid_row, column=col, padx=1, pady=1)
+                var       = tk.StringVar(value=default)
+                cat_entry = styled_entry(self.inner, width=11, textvariable=var)
+                cat_entry.grid(row=grid_row, column=col, padx=1, pady=1)
                 self._cat_vars[acc_id][cat] = var
+                self._cat_entries[cat].append(cat_entry)
                 col += 1
+
+        self._setup_tab_order()
+
+    def _setup_tab_order(self):
+        """Column-major Tab order: all balance rows → all rate rows → each category column."""
+        order = (
+            self._bal_entries
+            + self._rate_entries
+            + [e for cat in self.CATS for e in self._cat_entries[cat]]
+        )
+        n = len(order)
+        if n == 0:
+            return
+        for i, entry in enumerate(order):
+            def _next(e, i=i):
+                order[(i + 1) % n].focus_set()
+                return "break"
+            def _prev(e, i=i):
+                order[(i - 1) % n].focus_set()
+                return "break"
+            entry.bind("<Tab>",       _next)
+            entry.bind("<Shift-Tab>", _prev)
 
     def _load_previous(self):
         self._populate()
@@ -403,6 +793,8 @@ class SnapshotTab(tk.Frame):
         DeleteSnapshotDialog(self, on_done=self._populate)
 
     def _reset(self):
+        _dfmt = _DATE_FORMATS.get(db.get_setting("date_format", "YYYY-MM-DD"), "%Y-%m-%d")
+        self.date_var.set(datetime.datetime.now().strftime(f"{_dfmt} %H:%M"))
         for var in self._bal_vars.values():
             var.set("")
         for var in self._rate_vars.values():
@@ -464,16 +856,20 @@ class SnapshotTab(tk.Frame):
     # ------------------------------------------------------------------
 
     def _save(self):
-        date_str = self.date_var.get().strip()
-        for _fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        raw_date  = self.date_var.get().strip()
+        _dfmt     = _DATE_FORMATS.get(db.get_setting("date_format", "YYYY-MM-DD"), "%Y-%m-%d")
+        parsed_dt = None
+        for _fmt in (f"{_dfmt} %H:%M", f"{_dfmt}", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
             try:
-                datetime.datetime.strptime(date_str, _fmt)
+                parsed_dt = datetime.datetime.strptime(raw_date, _fmt)
                 break
             except ValueError:
                 pass
-        else:
-            messagebox.showerror("Error", "Invalid date. Use YYYY-MM-DD or YYYY-MM-DD HH:MM.")
+        if parsed_dt is None:
+            lbl = db.get_setting("date_format", "YYYY-MM-DD")
+            messagebox.showerror("Error", f"Invalid date. Expected format: {lbl} HH:MM")
             return
+        date_str = parsed_dt.strftime("%Y-%m-%d %H:%M")
 
         # Balances — blank means "don't record this account" (not £0)
         balances = {}
@@ -536,6 +932,7 @@ class SnapshotTab(tk.Frame):
         if new_allocs:
             parts.append(f"{len(new_allocs)} allocation(s) updated")
         messagebox.showinfo("Saved", "\n".join(parts) + ".")
+        self._reset()
 
 
 # ---------------------------------------------------------------------------
@@ -543,8 +940,15 @@ class SnapshotTab(tk.Frame):
 # ---------------------------------------------------------------------------
 
 class HistoryTab(tk.Frame):
+    CATS = ["Spending", "Deposit", "Emergency Fund", "Long Term Savings", "Pension"]
+
     def __init__(self, parent):
         super().__init__(parent, bg=BG)
+        self._time_range = db.get_setting("history_default_range", "ALL")
+        self._drilldown  = None   # None = full view; str = single category drill-down
+        self._hover_x    = []     # matplotlib date numbers for each data point
+        self._hover_data = []     # [{"date": str, "values": {name: float}}, ...]
+        self._cids       = []     # matplotlib event connection IDs
         self._build()
 
     def _build(self):
@@ -553,53 +957,212 @@ class HistoryTab(tk.Frame):
         styled_label(hdr, "Balance History", font=STYLE["font_h1"]).pack(side="left")
         styled_button(hdr, "⟳ Refresh", self.refresh, color=GREEN).pack(side="right")
 
+        # Mode row — back button lives here and is shown only during drill-down
         ctrl = styled_frame(self)
-        ctrl.pack(fill="x", padx=20, pady=4)
-
+        ctrl.pack(fill="x", padx=20, pady=(4, 2))
         styled_label(ctrl, "View:").pack(side="left")
-        self.mode = tk.StringVar(value="Net Worth")
-        for opt in ["Net Worth", "By Account", "By Category"]:
+        self.mode = tk.StringVar(value=db.get_setting("history_default_view", "By Category"))
+        for opt in ("By Account", "By Category"):
             tk.Radiobutton(ctrl, text=opt, variable=self.mode, value=opt,
                            bg=BG, fg=FG, selectcolor=BG3, activebackground=BG,
-                           font=STYLE["font"], command=self.refresh).pack(side="left", padx=8)
+                           font=STYLE["font"],
+                           command=self._on_mode_change).pack(side="left", padx=8)
+        self._back_btn = styled_button(ctrl, "← All categories",
+                                       self._clear_drilldown, color=SUBTEXT)
+        # packed/unpacked dynamically by _sync_back_btn
 
+        # Time range
+        range_row = styled_frame(self)
+        range_row.pack(fill="x", padx=20, pady=(0, 2))
+        styled_label(range_row, "Period:").pack(side="left")
+        self._range_btns = {}
+        for r in ("ALL", "2Y", "1Y", "6M", "3M", "YTD"):
+            btn = tk.Button(range_row, text=r,
+                            bg=BG3, fg=FG, relief="flat", font=STYLE["font"],
+                            padx=8, pady=2, cursor="hand2",
+                            activebackground=BG2, activeforeground=ACCENT,
+                            command=lambda r=r: self._set_range(r))
+            btn.pack(side="left", padx=2)
+            self._range_btns[r] = btn
+
+        # Chart
         self.fig = Figure(figsize=(10, 5), facecolor=BG)
         self.ax  = self.fig.add_subplot(111, facecolor=BG2)
         self.canvas_widget = embed_figure(self, self.fig)
         self.canvas_widget.pack(fill="both", expand=True, padx=20, pady=(4, 16))
 
+        self._update_range_styles()
         self.refresh()
 
+    # ---- State changes ----
+
+    def _on_mode_change(self):
+        self._drilldown = None
+        self._sync_back_btn()
+        self.refresh()
+
+    def _set_range(self, r):
+        self._time_range = r
+        self._update_range_styles()
+        self.refresh()
+
+    def _set_drilldown(self, cat):
+        self._drilldown = cat
+        self._sync_back_btn()
+        self.refresh()
+
+    def _clear_drilldown(self):
+        self._drilldown = None
+        self._sync_back_btn()
+        self.refresh()
+
+    def _update_range_styles(self):
+        for r, btn in self._range_btns.items():
+            active = (r == self._time_range)
+            btn.config(bg=ACCENT if active else BG3,
+                       fg=BG   if active else FG)
+
+    def _sync_back_btn(self):
+        if self._drilldown and self.mode.get() == "By Category":
+            self._back_btn.pack(side="left", padx=(16, 0))
+        else:
+            self._back_btn.pack_forget()
+
+    # ---- Date filtering ----
+
+    def _date_cutoff(self):
+        if self._time_range == "ALL":
+            return None
+        today = datetime.date.today()
+        if self._time_range == "YTD":
+            start = datetime.date(today.year, 1, 1)
+        else:
+            days = {"2Y": 730, "1Y": 365, "6M": 182, "3M": 91}[self._time_range]
+            start = today - datetime.timedelta(days=days)
+        return start.isoformat()
+
+    def _trim(self, items, date_fn):
+        cutoff = self._date_cutoff()
+        if not cutoff:
+            return items
+        return [x for x in items if date_fn(x) >= cutoff]
+
+    # ---- Interactive events (legend click + hover tooltip) ----
+
+    def _setup_interactions(self):
+        for cid in self._cids:
+            try:
+                self.fig.canvas.mpl_disconnect(cid)
+            except Exception:
+                pass
+        self._cids = []
+        self._bg   = None
+
+        self._annot = self.ax.annotate(
+            "", xy=(0, 0), xytext=(12, 12), textcoords="offset points",
+            bbox=dict(boxstyle="round,pad=0.5", fc=BG3, ec=SUBTEXT, alpha=0.93),
+            color=FG, fontsize=8, visible=False, zorder=10,
+        )
+
+        # Capture the already-drawn background (annotation is invisible so not included)
+        self._bg = self.fig.canvas.copy_from_bbox(self.fig.bbox)
+
+        leg = self.ax.get_legend()
+        if leg:
+            for text in leg.get_texts():
+                text.set_picker(5)
+            for handle in leg.legend_handles:
+                if handle is not None:
+                    handle.set_picker(5)
+
+        self._cids.append(
+            self.fig.canvas.mpl_connect("pick_event", self._on_pick))
+        self._cids.append(
+            self.fig.canvas.mpl_connect("motion_notify_event", self._on_hover))
+
+    def _on_pick(self, event):
+        if self.mode.get() != "By Category" or self._drilldown:
+            return
+        leg = self.ax.get_legend()
+        if not leg:
+            return
+        for text, handle in zip(leg.get_texts(), leg.legend_handles):
+            if event.artist in (text, handle):
+                cat_name = text.get_text()
+                if cat_name in self.CATS:
+                    self._set_drilldown(cat_name)
+                return
+
+    def _on_hover(self, event):
+        if not hasattr(self, "_annot") or not self._hover_x or self._bg is None:
+            return
+
+        def _blit_hide():
+            self._annot.set_visible(False)
+            self.fig.canvas.restore_region(self._bg)
+            self.fig.canvas.blit(self.fig.bbox)
+
+        if event.inaxes != self.ax or event.xdata is None:
+            if self._annot.get_visible():
+                _blit_hide()
+            return
+
+        idx    = min(range(len(self._hover_x)),
+                     key=lambda i: abs(self._hover_x[i] - event.xdata))
+        info   = self._hover_data[idx]
+        values = info.get("values", {})
+        if not values:
+            if self._annot.get_visible():
+                _blit_hide()
+            return
+
+        raw        = info["date"]
+        date_label = format_date(raw)
+
+        sorted_vals = sorted(values.items(), key=lambda kv: -kv[1])
+        lines = [date_label]
+        for name, val in sorted_vals:
+            lines.append(f"{name}: {fmt_gbp(val)}")
+        total = sum(values.values())
+        lines += ["─" * max(len(l) for l in lines), f"Total: {fmt_gbp(total)}"]
+
+        self._annot.set_text("\n".join(lines))
+        self._annot.xy = (self._hover_x[idx], event.ydata)
+        self._annot.set_visible(True)
+        self.fig.canvas.restore_region(self._bg)
+        self.ax.draw_artist(self._annot)
+        self.fig.canvas.blit(self.fig.bbox)
+
+    # ---- Refresh ----
+
     def refresh(self):
+        self._hover_x    = []
+        self._hover_data = []
         self.ax.clear()
         self.ax.set_facecolor(BG2)
         self.fig.patch.set_facecolor(BG)
         for spine in self.ax.spines.values():
             spine.set_edgecolor(BG3)
         self.ax.tick_params(colors=SUBTEXT)
-        self.ax.xaxis.label.set_color(SUBTEXT)
-        self.ax.yaxis.label.set_color(SUBTEXT)
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %y"))
         self.ax.xaxis.set_major_locator(mdates.AutoDateLocator())
         self.fig.autofmt_xdate()
 
-        mode = self.mode.get()
-
-        if mode == "Net Worth":
-            self._plot_net_worth()
-        elif mode == "By Account":
+        if self.mode.get() == "By Account":
             self._plot_by_account()
+        elif self._drilldown:
+            self._plot_category_drilldown(self._drilldown)
         else:
             self._plot_by_category()
 
         self.ax.yaxis.set_major_formatter(
-            matplotlib.ticker.FuncFormatter(lambda x, _: f"£{x:,.0f}"))
+            matplotlib.ticker.FuncFormatter(lambda x, _: f"£{x:,.2f}"))
         self.ax.legend(facecolor=BG3, edgecolor=BG3, labelcolor=FG,
                        fontsize=8, loc="upper left")
         self.fig.canvas.draw()
+        self._setup_interactions()
 
     def _dates_to_mpl(self, dates):
-        import matplotlib.dates as mdates
         result = []
         for d in dates:
             for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
@@ -610,48 +1173,114 @@ class HistoryTab(tk.Frame):
                     pass
         return result
 
-    def _plot_net_worth(self):
-        history = db.get_net_worth_history()
-        if not history:
-            return
-        dates, totals = zip(*history)
-        x = self._dates_to_mpl(dates)
-        self.ax.plot(x, totals, color=ACCENT, linewidth=2, label="Net Worth")
-        self.ax.fill_between(x, totals, alpha=0.15, color=ACCENT)
-        self.ax.set_title("Net Worth Over Time", color=FG, pad=10)
+    # ---- Helpers ----
+
+    def _signed_stackplot(self, x, names, ys_mat, colours):
+        has_pos = {n for n, ys in zip(names, ys_mat) if any(v > 0 for v in ys)}
+        has_neg = {n for n, ys in zip(names, ys_mat) if any(v < 0 for v in ys)}
+
+        pos = [(n, [max(0.0, v) for v in ys], c)
+               for n, ys, c in zip(names, ys_mat, colours) if n in has_pos]
+        neg = [(n, [min(0.0, v) for v in ys], c)
+               for n, ys, c in zip(names, ys_mat, colours) if n in has_neg]
+
+        if pos:
+            pn, pys, pc = zip(*pos)
+            self.ax.stackplot(x, pys, labels=pn, colors=pc, alpha=0.7)
+
+        if neg:
+            nn, nys, nc = zip(*neg)
+            polys = self.ax.stackplot(x, nys, colors=nc, alpha=0.7)
+            for poly, name in zip(polys, nn):
+                if name not in has_pos:
+                    poly.set_label(name)
+
+        self.ax.axhline(0, color=SUBTEXT, linewidth=0.5, linestyle="--")
+
+    # ---- Plot methods ----
 
     def _plot_by_account(self):
-        accounts = db.get_all_accounts()
-        dates = db.get_snapshot_dates()[::-1]
-        if not dates:
+        accounts = db.get_all_accounts(include_inactive=True)
+        if not accounts:
             return
         all_histories = db.get_all_balance_histories()
-        colours = plt.cm.tab20.colors
-        x = self._dates_to_mpl(dates)
+        active_ids = {acc["id"] for acc in accounts if acc["is_active"]}
+
+        active_dates = sorted({
+            d for acc_id, hist in all_histories.items()
+            if acc_id in active_ids for d, _ in hist
+        })
+        active_dates = self._trim(active_dates, date_fn=lambda d: d)
+        if not active_dates:
+            return
+
+        colours    = plt.cm.tab20.colors
+        x          = self._dates_to_mpl(active_dates)
+        hover_vals = [{} for _ in active_dates]
+
         for i, acc in enumerate(accounts):
-            history = dict(all_histories.get(acc["id"], []))
-            ys = [history.get(d, 0.0) for d in dates]
+            hist = all_histories.get(acc["id"], [])
+            if not hist:
+                continue
+            hd = {d: b for d, b in hist}
+            if acc["is_active"]:
+                last, ys = None, []
+                for j, d in enumerate(active_dates):
+                    if d in hd:
+                        last = hd[d]
+                    val = last if last is not None else 0.0
+                    ys.append(val)
+                    if val:
+                        hover_vals[j][acc["account_name"]] = val
+            else:
+                ys = [hd.get(d, 0.0) for d in active_dates]
+                for j, val in enumerate(ys):
+                    if val:
+                        hover_vals[j][acc["account_name"]] = val
+
             if any(y != 0 for y in ys):
                 self.ax.plot(x, ys, label=acc["account_name"],
                              color=colours[i % len(colours)], linewidth=1.5)
+
+        self._hover_x    = list(x)
+        self._hover_data = [{"date": d, "values": hv}
+                            for d, hv in zip(active_dates, hover_vals)]
         self.ax.set_title("Balance by Account", color=FG, pad=10)
 
     def _plot_by_category(self):
-        history = db.get_category_history()
+        history = self._trim(db.get_category_history(),
+                             date_fn=lambda h: h["date"])
         if not history:
             return
-        cats = list(history[0]["totals"].keys())
-        x = self._dates_to_mpl([h["date"] for h in history])
-        bottoms = [0.0] * len(history)
-        for cat in cats:
-            ys = [h["totals"].get(cat, 0.0) for h in history]
-            colour = CAT_COLOURS.get(cat, SUBTEXT)
-            self.ax.fill_between(x, bottoms, [b + y for b, y in zip(bottoms, ys)],
-                                  alpha=0.7, color=colour, label=cat)
-            self.ax.plot(x, [b + y for b, y in zip(bottoms, ys)],
-                         color=colour, linewidth=0.5)
-            bottoms = [b + y for b, y in zip(bottoms, ys)]
-        self.ax.set_title("Balance by Spending Category", color=FG, pad=10)
+        cats    = list(history[0]["totals"].keys())
+        x       = self._dates_to_mpl([h["date"] for h in history])
+        ys_mat  = [[h["totals"].get(cat, 0.0) for h in history] for cat in cats]
+        colours = [CAT_COLOURS.get(cat, SUBTEXT) for cat in cats]
+        self._signed_stackplot(x, cats, ys_mat, colours)
+        self._hover_x    = list(x)
+        self._hover_data = [{"date": h["date"], "values": dict(h["totals"])}
+                            for h in history]
+        self.ax.set_title(
+            "Balance by Spending Category  ·  click a legend entry to drill down",
+            color=FG, pad=10)
+
+    def _plot_category_drilldown(self, cat_name):
+        history = self._trim(db.get_category_account_breakdown(cat_name),
+                             date_fn=lambda h: h["date"])
+        if not history:
+            self.ax.set_title(f"{cat_name} — no data in range", color=FG, pad=10)
+            return
+        all_accs = sorted({name for h in history for name in h["accounts"]})
+        tab20    = plt.cm.tab20.colors
+        x        = self._dates_to_mpl([h["date"] for h in history])
+        ys_mat   = [[h["accounts"].get(acc, 0.0) for h in history] for acc in all_accs]
+        colours  = [tab20[i % len(tab20)] for i in range(len(all_accs))]
+        self._signed_stackplot(x, all_accs, ys_mat, colours)
+        self._hover_x    = list(x)
+        self._hover_data = [{"date": h["date"], "values": dict(h["accounts"])}
+                            for h in history]
+        self.ax.set_title(f"{cat_name} — by account  ·  use ← All categories to go back",
+                          color=FG, pad=10)
 
 
 # ---------------------------------------------------------------------------
@@ -714,7 +1343,7 @@ class CategoriesTab(tk.Frame):
         for cat, val in totals.items():
             if val != 0:
                 pct = val / grand * 100
-                self.tree.insert("", "end", values=(cat, fmt_gbp(val), f"{pct:.1f}%"))
+                self.tree.insert("", "end", values=(cat, fmt_gbp(val), f"{pct:.2f}%"))
                 labels.append(cat)
                 sizes.append(abs(val))
                 colours.append(CAT_COLOURS.get(cat, SUBTEXT))
@@ -817,7 +1446,7 @@ class InterestTab(tk.Frame):
                 fmt_gbp(r["balance"]),
                 fmt_pct(r["rate"]),
                 fmt_gbp(r["yearly_interest"]),
-                f"£{r['daily_interest']:.4f}",
+                fmt_gbp(r["daily_interest"]),
                 fmt_gbp(proj.get("projected", r["balance"])),
                 fmt_gbp(proj.get("gain", 0.0)),
             ))
@@ -1030,135 +1659,390 @@ class MortgageTab(tk.Frame):
 
 
 # ---------------------------------------------------------------------------
-# Tab 7 — Accounts management
+# Tab 7 — Raw recorded balances pivot
 # ---------------------------------------------------------------------------
 
-class AccountsTab(tk.Frame):
+class EditBalanceDialog(tk.Toplevel):
+    """Modal dialog for editing or deleting a single balance snapshot entry."""
+
+    def __init__(self, parent, *, acc_name: str, date_str: str,
+                 current_balance: float, on_done):
+        super().__init__(parent)
+        self.title("Edit Balance Entry")
+        self.resizable(False, False)
+        self.configure(bg=BG)
+        self._on_done  = on_done
+        self._acc_name = acc_name
+        self._date_str = date_str   # raw stored date
+        self._acc_id   = None
+        for acc in getattr(parent, "_accounts", []):
+            if acc["account_name"] == acc_name:
+                self._acc_id = acc["id"]
+                break
+
+        pad = {"padx": 16, "pady": 6}
+
+        tk.Label(self, text="Account", bg=BG, fg=SUBTEXT, font=STYLE["font"]).grid(
+            row=0, column=0, sticky="e", **pad)
+        tk.Label(self, text=acc_name, bg=BG, fg=FG, font=STYLE["font_bold"]).grid(
+            row=0, column=1, sticky="w", **pad)
+
+        tk.Label(self, text="Date", bg=BG, fg=SUBTEXT, font=STYLE["font"]).grid(
+            row=1, column=0, sticky="e", **pad)
+        tk.Label(self, text=format_date(date_str), bg=BG, fg=FG,
+                 font=STYLE["font_bold"]).grid(row=1, column=1, sticky="w", **pad)
+
+        tk.Label(self, text="Balance (£)", bg=BG, fg=SUBTEXT, font=STYLE["font"]).grid(
+            row=2, column=0, sticky="e", **pad)
+        self._bal_var = tk.StringVar(value=f"{current_balance:.2f}")
+        bal_entry = ttk.Entry(self, textvariable=self._bal_var, width=18,
+                              font=STYLE["font"])
+        bal_entry.grid(row=2, column=1, sticky="w", **pad)
+        bal_entry.selection_range(0, tk.END)
+        bal_entry.focus_set()
+
+        btn_frame = tk.Frame(self, bg=BG)
+        btn_frame.grid(row=3, column=0, columnspan=2, pady=(8, 16))
+        styled_button(btn_frame, "Save", self._save, color=GREEN).pack(
+            side="left", padx=6)
+        styled_button(btn_frame, "Delete Entry", self._delete, color=RED).pack(
+            side="left", padx=6)
+        styled_button(btn_frame, "Cancel", self.destroy, color=BG3).pack(
+            side="left", padx=6)
+
+        self.transient(parent)
+        self.grab_set()
+        self.wait_visibility()
+        self.update_idletasks()
+        px = parent.winfo_rootx() + parent.winfo_width()  // 2 - self.winfo_width()  // 2
+        py = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{px}+{py}")
+
+    def _save(self):
+        if self._acc_id is None:
+            messagebox.showerror("Error", "Account not found.", parent=self)
+            return
+        try:
+            new_bal = float(
+                self._bal_var.get().replace(",", "").replace("£", "").strip()
+            )
+        except ValueError:
+            messagebox.showerror("Invalid input", "Please enter a valid number.", parent=self)
+            return
+        db.update_balance_entry(self._acc_id, self._date_str, new_bal)
+        self.destroy()
+        self._on_done()
+
+    def _delete(self):
+        if self._acc_id is None:
+            messagebox.showerror("Error", "Account not found.", parent=self)
+            return
+        if not messagebox.askyesno(
+            "Confirm Delete",
+            f"Delete the balance entry for\n{self._acc_name}"
+            f" on {format_date(self._date_str)}?",
+            parent=self,
+        ):
+            return
+        db.delete_snapshot_entry(self._acc_id, self._date_str)
+        self.destroy()
+        self._on_done()
+
+
+class CalcedBalancesTab(tk.Frame):
+    DATE_W = 110
+    COL_W  = 110
+
     def __init__(self, parent):
         super().__init__(parent, bg=BG)
-        self._selected_id = None
+        self._accounts       = []   # ordered list matching column positions
+        self._raw_dates      = []   # stored date strings matching row positions
+        self._sel_acc_id     = None
+        self._sel_acc_name   = None
+        self._sel_date       = None
+        self._sel_balance    = None
         self._build()
 
     def _build(self):
-        # ---- header row ----
         hdr = styled_frame(self)
         hdr.pack(fill="x", padx=20, pady=(16, 4))
-        styled_label(hdr, "Accounts", font=STYLE["font_h1"]).pack(side="left")
-        styled_button(hdr, "⊗ Deactivate", self._deactivate, color=RED).pack(side="right")
-        styled_button(hdr, "⟳ Refresh", self.refresh, color=ACCENT).pack(side="right", padx=8)
-        styled_button(hdr, "+ Add Account", self._add_account, color=GREEN).pack(side="right", padx=8)
+        styled_label(hdr, "Recorded Balances", font=STYLE["font_h1"]).pack(side="left")
+        self._edit_btn = styled_button(hdr, "✎ Edit Selected", self._open_edit, color=YELLOW)
+        self._edit_btn.pack(side="right")
+        self._edit_btn.config(state="disabled")
+        styled_button(hdr, "⟳ Refresh", self.refresh, color=GREEN).pack(side="right", padx=8)
 
-        # ---- selected-account edit bar ----
-        edit_bar = tk.Frame(self, bg=BG2)
-        edit_bar.pack(fill="x", padx=20, pady=(0, 6))
+        self._sel_label = tk.Label(self, text="Click a balance cell to select it",
+                                   bg=BG, fg=SUBTEXT, font=STYLE["font"])
+        self._sel_label.pack(fill="x", padx=24, pady=(0, 2))
 
-        self._sel_label = tk.Label(edit_bar, text="Select an account to edit its type",
-                                   bg=BG2, fg=SUBTEXT, font=STYLE["font"],
-                                   width=32, anchor="w")
-        self._sel_label.pack(side="left", padx=(12, 8), pady=6)
-
-        tk.Frame(edit_bar, bg=BG3, width=1).pack(side="left", fill="y", pady=4)
-
-        tk.Label(edit_bar, text="Account type:", bg=BG2, fg=FG,
-                 font=STYLE["font"]).pack(side="left", padx=(12, 4))
-
-        self._pt_var = tk.StringVar()
-        self._pt_combo = ttk.Combobox(edit_bar, textvariable=self._pt_var, width=22,
-                                       font=STYLE["font"], state="normal")
-        self._pt_combo["values"] = db.get_product_types()
-        self._pt_combo.pack(side="left", padx=(0, 6))
-
-        styled_button(edit_bar, "+ New type", self._add_type_inline,
-                      color=YELLOW).pack(side="left", padx=(0, 4))
-        styled_button(edit_bar, "Save type", self._save_type,
-                      color=GREEN).pack(side="left")
-
-        tk.Label(edit_bar, text="Rates & allocations → Log Snapshot",
-                 bg=BG2, fg=SUBTEXT, font=STYLE["font"]).pack(side="right", padx=12)
-
-        # ---- full-width tree ----
-        tree_frame = styled_frame(self)
-        tree_frame.pack(fill="both", expand=True, padx=20, pady=(0, 16))
-
-        cols = ("name", "product_type", "rate", "balance")
-        self.tree, sb = make_tree(tree_frame, cols, height=30)
-        for col, hdr_text, w, anch in [
-            ("name",         "Account Name",  260, "w"),
-            ("product_type", "Account Type",  160, "w"),
-            ("rate",         "Rate %",         90, "e"),
-            ("balance",      "Balance",        120, "e"),
-        ]:
-            self.tree.heading(col, text=hdr_text)
-            self.tree.column(col, width=w, anchor=anch)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self._tree_frame = tk.Frame(self, bg=BG)
+        self._tree_frame.pack(fill="both", expand=True, padx=20, pady=(2, 16))
 
         self.refresh()
+
+    def _clear_selection(self):
+        self._sel_acc_id   = None
+        self._sel_acc_name = None
+        self._sel_date     = None
+        self._sel_balance  = None
+        self._sel_label.config(text="Click a balance cell to select it", fg=SUBTEXT)
+        self._edit_btn.config(state="disabled")
 
     def refresh(self):
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-        _, snapshot = db.get_latest_snapshot()
-        today = datetime.date.today().isoformat()
-        rates = db._get_rates_on_date(today)
-        for acc in db.get_all_accounts():
-            acc_id = acc["id"]
-            rate   = rates.get(acc_id, 0.0)
-            self.tree.insert("", "end", iid=str(acc_id), values=(
-                acc["account_name"],
-                acc.get("product_type") or "—",
-                f"{rate * 100:.4f}%" if rate else "—",
-                fmt_gbp(snapshot.get(acc_id)),
-            ))
+        self._clear_selection()
+        for w in self._tree_frame.winfo_children():
+            w.destroy()
 
-    def _on_select(self, event):
-        sel = self.tree.selection()
-        if not sel:
+        accounts      = db.get_all_accounts(include_inactive=True)
+        all_histories = db.get_all_balance_histories()
+
+        if not accounts:
+            styled_label(self._tree_frame, "No accounts found.", fg=SUBTEXT).pack(pady=20)
             return
-        self._selected_id = int(sel[0])
-        acc = db.get_account_by_id(self._selected_id)
-        self._sel_label.config(text=acc["account_name"], fg=FG)
-        self._pt_var.set(acc.get("product_type") or "")
 
-    def _add_type_inline(self):
-        name = simpledialog.askstring("New Account Type",
-                                      "Enter new account type name:",
-                                      parent=self)
-        if name and name.strip():
-            db.add_product_type(name.strip())
-            self._pt_combo["values"] = db.get_product_types()
-            self._pt_var.set(name.strip())
+        self._accounts = sorted(accounts, key=lambda a: (a["bank"] or "", a["account_name"]))
 
-    def _save_type(self):
-        if not self._selected_id:
-            messagebox.showwarning("No selection", "Select an account first.")
+        self._raw_dates = sorted(
+            {d for hist in all_histories.values() for d, _ in hist},
+            reverse=True,
+        )
+        if not self._raw_dates:
+            styled_label(self._tree_frame, "No snapshot data yet.", fg=SUBTEXT).pack(pady=20)
             return
-        ptype = self._pt_var.get().strip()
-        # Persist a brand-new type if the user typed one that's not in the list
-        if ptype and ptype not in db.get_product_types():
-            db.add_product_type(ptype)
-            self._pt_combo["values"] = db.get_product_types()
-        db.update_account_product_type(self._selected_id, ptype or None)
-        self.refresh()
-        # Re-select the same row so the edit bar stays populated
-        self.tree.selection_set(str(self._selected_id))
 
-    def _deactivate(self):
-        if not self._selected_id:
-            messagebox.showwarning("No selection", "Select an account first.")
+        lookup = {
+            acc_id: {d: b for d, b in hist}
+            for acc_id, hist in all_histories.items()
+        }
+
+        dw, cw  = self.DATE_W, self.COL_W
+        total_w = dw + cw * len(self._accounts)
+
+        make_tree(self._tree_frame, [], height=1)
+        date_col = "date"
+        acc_cols = [f"a{acc['id']}" for acc in self._accounts]
+        cols     = [date_col] + acc_cols
+
+        tree = ttk.Treeview(self._tree_frame, columns=cols, show="headings",
+                            style="Finance.Treeview", height=30)
+
+        tree.heading(date_col, text="Date")
+        tree.column(date_col, width=dw, anchor="w", stretch=False, minwidth=dw)
+        for acc in self._accounts:
+            cid    = f"a{acc['id']}"
+            bank   = acc.get("bank") or ""
+            name   = acc["account_name"]
+            prefix = f"{bank} - "
+            label  = name[len(prefix):] if bank and name.startswith(prefix) else name
+            tree.heading(cid, text=label)
+            tree.column(cid, width=cw, anchor="e", stretch=False, minwidth=cw)
+
+        # Bank-name canvas row
+        bank_h      = 22
+        bank_canvas = tk.Canvas(self._tree_frame, bg=BG3, height=bank_h,
+                                highlightthickness=0,
+                                scrollregion=(0, 0, total_w, bank_h))
+        bank_canvas.create_rectangle(0, 0, dw, bank_h, fill=BG3, outline=BG2, width=1)
+        x = dw
+        i = 0
+        while i < len(self._accounts):
+            bank = self._accounts[i].get("bank") or ""
+            j = i
+            while j < len(self._accounts) and (self._accounts[j].get("bank") or "") == bank:
+                j += 1
+            span = cw * (j - i)
+            bank_canvas.create_rectangle(x, 0, x + span, bank_h,
+                                         fill=BG3, outline=BG2, width=1)
+            if bank:
+                bank_canvas.create_text(x + span // 2, bank_h // 2, text=bank,
+                                        fill=ACCENT, font=STYLE["font_bold"], anchor="center")
+            x += span
+            i  = j
+
+        # Scrollbars
+        v_sb = ttk.Scrollbar(self._tree_frame, orient="vertical",   command=tree.yview)
+        h_sb = ttk.Scrollbar(self._tree_frame, orient="horizontal")
+
+        def _xscroll(first, last):
+            h_sb.set(first, last)
+            bank_canvas.xview_moveto(first)
+
+        tree.configure(yscrollcommand=v_sb.set, xscrollcommand=_xscroll)
+        h_sb.configure(command=lambda *a: (tree.xview(*a), bank_canvas.xview(*a)))
+
+        bank_canvas.grid(row=0, column=0, sticky="ew")
+        tree.grid(row=1, column=0, sticky="nsew")
+        v_sb.grid(row=1, column=1, sticky="ns")
+        h_sb.grid(row=2, column=0, sticky="ew")
+        self._tree_frame.grid_rowconfigure(1, weight=1)
+        self._tree_frame.grid_columnconfigure(0, weight=1)
+
+        # Populate rows — store raw date in iid for easy lookup
+        for i, date_str in enumerate(self._raw_dates):
+            values = [format_date(date_str)]
+            for acc in self._accounts:
+                bal = lookup.get(acc["id"], {}).get(date_str)
+                values.append(fmt_gbp(bal) if bal is not None else "")
+            tree.insert("", "end", iid=date_str, values=values,
+                        tags=("odd" if i % 2 else "even",))
+
+        tree.tag_configure("even", background=BG2)
+        tree.tag_configure("odd",  background=BG)
+        tree.tag_configure("selected_cell", background=BG3, foreground=ACCENT)
+
+        # Cell click — identify which (date, account) was clicked
+        def _on_click(event):
+            region = tree.identify_region(event.x, event.y)
+            if region != "cell":
+                self._clear_selection()
+                return
+            row_iid = tree.identify_row(event.y)
+            col_id  = tree.identify_column(event.x)
+            if not row_iid:
+                return
+            col_idx = int(col_id.replace("#", "")) - 1   # 0 = date col, 1+ = accounts
+            if col_idx == 0:
+                self._clear_selection()
+                return
+            acc_idx = col_idx - 1
+            if acc_idx >= len(self._accounts):
+                return
+            acc     = self._accounts[acc_idx]
+            bal_str = tree.item(row_iid, "values")[col_idx]
+            if not bal_str:
+                self._clear_selection()
+                self._sel_label.config(
+                    text=f"No entry for {acc['account_name']} on {format_date(row_iid)}",
+                    fg=SUBTEXT)
+                return
+            # Parse balance back from fmt_gbp output ("-£1,234.56")
+            neg  = bal_str.startswith("-")
+            val  = float(bal_str.replace("-", "").replace("£", "").replace(",", ""))
+            self._sel_acc_id  = acc["id"]
+            self._sel_acc_name = acc["account_name"]
+            self._sel_date    = row_iid          # raw stored date string
+            self._sel_balance = -val if neg else val
+            self._sel_label.config(
+                text=f"Selected:  {acc['account_name']}  ·  {format_date(row_iid)}  ·  {bal_str}",
+                fg=FG)
+            self._edit_btn.config(state="normal")
+
+        tree.bind("<ButtonRelease-1>", _on_click)
+        tree.bind("<Double-Button-1>", lambda e: (_on_click(e), self._open_edit()))
+
+        def _scroll(e):
+            tree.yview_scroll(-1 * (e.delta // 120), "units")
+        tree.bind("<Enter>", lambda e: tree.bind_all("<MouseWheel>", _scroll))
+        tree.bind("<Leave>", lambda e: tree.unbind_all("<MouseWheel>"))
+
+    def _open_edit(self):
+        if self._sel_acc_id is None:
             return
-        acc = db.get_account_by_id(self._selected_id)
-        if messagebox.askyesno("Confirm", f"Deactivate '{acc['account_name']}'?\n"
-                               "It will no longer appear in snapshots but history is kept."):
-            db.deactivate_account(self._selected_id)
-            self._selected_id = None
-            self._sel_label.config(text="Select an account to edit its type", fg=SUBTEXT)
-            self._pt_var.set("")
-            self.refresh()
+        EditBalanceDialog(
+            self,
+            acc_name=self._sel_acc_name,
+            date_str=self._sel_date,
+            current_balance=self._sel_balance,
+            on_done=self.refresh,
+        )
 
-    def _add_account(self):
-        AddAccountDialog(self, self.refresh)
+
+# ---------------------------------------------------------------------------
+# Tab 8 — Settings
+# ---------------------------------------------------------------------------
+
+class SettingsTab(tk.Frame):
+    _SETTINGS = [
+        {
+            "section": "Display",
+            "items": [
+                {
+                    "key":     "date_format",
+                    "label":   "Date display format",
+                    "type":    "select",
+                    "options": ["YYYY-MM-DD", "DD/MM/YYYY", "DD Mon YYYY", "MM/DD/YYYY"],
+                    "default": "YYYY-MM-DD",
+                },
+            ],
+        },
+        {
+            "section": "History chart defaults",
+            "items": [
+                {
+                    "key":     "history_default_view",
+                    "label":   "Default view",
+                    "type":    "select",
+                    "options": ["By Category", "By Account"],
+                    "default": "By Category",
+                },
+                {
+                    "key":     "history_default_range",
+                    "label":   "Default time range",
+                    "type":    "select",
+                    "options": ["ALL", "2Y", "1Y", "6M", "3M", "YTD"],
+                    "default": "ALL",
+                },
+            ],
+        },
+    ]
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=BG)
+        self._vars    = {}
+        self._preview = {}
+        self._build()
+
+    def _build(self):
+        hdr = styled_frame(self)
+        hdr.pack(fill="x", padx=20, pady=(16, 4))
+        styled_label(hdr, "Settings", font=STYLE["font_h1"]).pack(side="left")
+        styled_button(hdr, "Save", self._save, color=GREEN).pack(side="right")
+
+        content = styled_frame(self)
+        content.pack(fill="x", padx=20, pady=8)
+
+        for group in self._SETTINGS:
+            section_label(content, f"  {group['section']}").pack(fill="x", pady=(16, 4))
+
+            for item in group["items"]:
+                key     = item["key"]
+                current = db.get_setting(key, item["default"])
+                var     = tk.StringVar(value=current)
+                self._vars[key] = var
+
+                row = styled_frame(content)
+                row.pack(fill="x", pady=5)
+
+                tk.Label(row, text=item["label"], bg=BG, fg=FG,
+                         font=STYLE["font"], width=26, anchor="w").pack(side="left")
+
+                cb = ttk.Combobox(row, textvariable=var, values=item["options"],
+                                  state="readonly", width=22, font=STYLE["font"])
+                cb.pack(side="left", padx=(0, 16))
+
+                if key == "date_format":
+                    lbl = tk.Label(row, text="", bg=BG, fg=SUBTEXT,
+                                   font=STYLE["font_mono"])
+                    lbl.pack(side="left")
+                    self._preview[key] = lbl
+                    var.trace_add("write", lambda *_, k=key: self._update_preview(k))
+                    self._update_preview(key)
+
+        self._status = tk.Label(content, text="", bg=BG, fg=GREEN, font=STYLE["font"])
+        self._status.pack(anchor="w", pady=(24, 0))
+
+    def _update_preview(self, key):
+        if key == "date_format":
+            fmt = _DATE_FORMATS.get(self._vars[key].get(), "%Y-%m-%d")
+            sample = datetime.date.today().strftime(fmt)
+            self._preview[key].config(text=f"e.g. {sample}")
+
+    def _save(self):
+        for key, var in self._vars.items():
+            db.set_setting(key, var.get())
+        self._status.config(text="✓ Saved")
+        self.after(2000, lambda: self._status.config(text=""))
 
 
 # ---------------------------------------------------------------------------
@@ -1400,6 +2284,309 @@ class AddAccountDialog(BaseDialog):
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Income tab
+# ---------------------------------------------------------------------------
+
+class IncomeTab(tk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent, bg=BG)
+        self._build()
+
+    def _build(self):
+        # Header
+        hdr = styled_frame(self)
+        hdr.pack(fill="x", padx=20, pady=(16, 4))
+        styled_label(hdr, "Income", font=STYLE["font_h1"]).pack(side="left")
+        styled_button(hdr, "⟳ Refresh", self.refresh, color=GREEN).pack(side="right")
+
+        self._chart_group = tk.StringVar(value="source")
+        for val, label in (("source", "By Source"), ("subsource", "By Sub-source")):
+            tk.Radiobutton(
+                hdr, text=label, variable=self._chart_group, value=val,
+                bg=BG, fg=FG, selectcolor=BG3, activebackground=BG,
+                activeforeground=ACCENT, font=STYLE["font"],
+                command=self._redraw_chart,
+            ).pack(side="right", padx=4)
+
+        self._sel_month  = None   # "YYYY-MM" when a bar is clicked, None = all
+        self._month_list = []     # ordered list of months matching bar x-positions
+
+        # Chart
+        self.fig = Figure(figsize=(10, 3), facecolor=BG)
+        self.ax  = self.fig.add_subplot(111, facecolor=BG)
+        self.fig.subplots_adjust(left=0.07, right=0.98, top=0.88, bottom=0.15)
+        self.canvas_widget = embed_figure(self, self.fig)
+        self.canvas_widget.pack(fill="x", padx=20, pady=(0, 6))
+        self.fig.canvas.mpl_connect("button_press_event", self._on_bar_click)
+
+        # Month drill-down bar (hidden until a bar is clicked)
+        self._drill_bar = tk.Frame(self, bg=BG2)
+        self._drill_bar.pack(fill="x", padx=20, pady=(0, 4))
+        self._drill_label = tk.Label(self._drill_bar, text="", bg=BG2, fg=ACCENT,
+                                      font=STYLE["font_bold"])
+        self._drill_label.pack(side="left", padx=(10, 12), pady=4)
+        styled_button(self._drill_bar, "← All months", self._clear_drill,
+                      color=SUBTEXT).pack(side="left")
+        self._drill_bar.pack_forget()   # hidden initially
+
+        # Entry form
+        form = tk.Frame(self, bg=BG2)
+        form.pack(fill="x", padx=20, pady=(4, 8))
+
+        def _lbl(text):
+            return tk.Label(form, text=text, bg=BG2, fg=SUBTEXT, font=STYLE["font"])
+
+        def _ent(var, w=14):
+            return tk.Entry(form, textvariable=var, bg=BG3, fg=FG,
+                            insertbackground=FG, relief="flat",
+                            font=STYLE["font"], width=w)
+
+        # Date
+        _lbl("Date:").pack(side="left", padx=(10, 3), pady=8)
+        self._date_var = tk.StringVar()
+        _dfmt = _DATE_FORMATS.get(db.get_setting("date_format", "YYYY-MM-DD"), "%Y-%m-%d")
+        self._date_var.set(datetime.datetime.now().strftime(f"{_dfmt} %H:%M"))
+        _ent(self._date_var, 16).pack(side="left", padx=(0, 10))
+
+        # Amount
+        _lbl("Amount £:").pack(side="left", padx=(0, 3))
+        self._amount_var = tk.StringVar()
+        _ent(self._amount_var, 10).pack(side="left", padx=(0, 10))
+
+        # Source
+        _lbl("Source:").pack(side="left", padx=(0, 3))
+        self._source_var = tk.StringVar()
+        self._source_combo = ttk.Combobox(form, textvariable=self._source_var,
+                                           width=16, font=STYLE["font"], state="normal")
+        self._source_combo["values"] = db.get_income_sources()
+        self._source_combo.pack(side="left", padx=(0, 10))
+
+        # Sub-source (dynamic — updates when source changes)
+        _lbl("Sub-source:").pack(side="left", padx=(0, 3))
+        self._cat_var = tk.StringVar()
+        self._subsource_combo = ttk.Combobox(form, textvariable=self._cat_var,
+                                              width=16, font=STYLE["font"], state="normal")
+        self._subsource_combo["values"] = db.get_income_sub_sources()
+        self._subsource_combo.pack(side="left", padx=(0, 10))
+
+        def _on_source_change(*_):
+            src = self._source_var.get().strip()
+            self._subsource_combo["values"] = db.get_income_sub_sources(src or None)
+
+        self._source_var.trace_add("write", _on_source_change)
+        self._source_combo.bind("<<ComboboxSelected>>", _on_source_change)
+
+        styled_button(form, "Save", self._save, color=GREEN).pack(side="left", padx=(0, 6))
+        styled_button(form, "Clear", self._clear_form, color=BG3).pack(side="left")
+
+        # Delete selected button (right-aligned)
+        styled_button(form, "🗑 Delete selected", self._delete_selected,
+                      color=RED).pack(side="right", padx=10)
+
+        # Tree
+        tree_frame = styled_frame(self)
+        tree_frame.pack(fill="both", expand=True, padx=20, pady=(0, 16))
+
+        cols = ("date", "amount", "source", "subcategory")
+        self.tree, sb = make_tree(tree_frame, cols, height=28)
+        for col, hdr_text, w, anch in [
+            ("date",        "Date",       140, "w"),
+            ("amount",      "Amount",     110, "e"),
+            ("source",      "Source",     160, "w"),
+            ("subcategory", "Sub-source",  160, "w"),
+        ]:
+            self.tree.heading(col, text=hdr_text)
+            self.tree.column(col, width=w, anchor=anch)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        def _scroll(e):
+            self.tree.yview_scroll(-1 * (e.delta // 120), "units")
+        self.tree.bind("<Enter>", lambda e: self.tree.bind_all("<MouseWheel>", _scroll))
+        self.tree.bind("<Leave>", lambda e: self.tree.unbind_all("<MouseWheel>"))
+
+        self.refresh()
+
+    def _save(self):
+        raw_date   = self._date_var.get().strip()
+        raw_amount = self._amount_var.get().strip().replace("£", "").replace(",", "")
+        source     = self._source_var.get().strip()
+        cat        = self._cat_var.get().strip()
+
+        # Parse date using configured format
+        _dfmt = _DATE_FORMATS.get(db.get_setting("date_format", "YYYY-MM-DD"), "%Y-%m-%d")
+        parsed_dt = None
+        for _fmt in (f"{_dfmt} %H:%M", _dfmt, "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                parsed_dt = datetime.datetime.strptime(raw_date, _fmt)
+                break
+            except ValueError:
+                pass
+        if parsed_dt is None:
+            messagebox.showerror("Invalid date",
+                                 f"Could not parse date. Expected format: {_dfmt} HH:MM")
+            return
+
+        if not raw_amount:
+            messagebox.showwarning("Validation", "Amount is required.")
+            return
+        try:
+            amount = float(raw_amount)
+        except ValueError:
+            messagebox.showwarning("Validation", "Amount must be a number.")
+            return
+
+        date_str = parsed_dt.strftime("%Y-%m-%d %H:%M")
+        db.add_income(date_str, amount, source or None, cat or None)
+
+        # Refresh source/sub-source lists in case new values were typed
+        self._source_combo["values"] = db.get_income_sources()
+        self._subsource_combo["values"] = db.get_income_sub_sources(source or None)
+        self._clear_form()
+        self.refresh()
+
+    def _clear_form(self):
+        _dfmt = _DATE_FORMATS.get(db.get_setting("date_format", "YYYY-MM-DD"), "%Y-%m-%d")
+        self._date_var.set(datetime.datetime.now().strftime(f"{_dfmt} %H:%M"))
+        self._amount_var.set("")
+        self._source_var.set("")
+        self._cat_var.set("")
+
+    def _delete_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("No selection", "Select one or more rows to delete.")
+            return
+        if not messagebox.askyesno("Confirm",
+                                   f"Delete {len(sel)} income entr"
+                                   f"{'y' if len(sel) == 1 else 'ies'}?"):
+            return
+        for iid in sel:
+            db.delete_income(int(iid))
+        self.refresh()
+
+    def _on_bar_click(self, event):
+        if event.inaxes != self.ax or not self._month_list:
+            return
+        idx = int(round(event.xdata)) if event.xdata is not None else -1
+        if 0 <= idx < len(self._month_list):
+            self._sel_month = self._month_list[idx]
+            try:
+                display = datetime.datetime.strptime(
+                    self._sel_month, "%Y-%m").strftime("%B %Y")
+            except ValueError:
+                display = self._sel_month
+            self._drill_label.config(
+                text=f"Showing: {display}  ·  click another bar or ← to show all")
+            self._drill_bar.pack(fill="x", padx=20, pady=(0, 4))
+            self._draw_chart(self._last_entries)
+            self._populate_tree(self._last_entries)
+
+    def _clear_drill(self):
+        self._sel_month = None
+        self._drill_bar.pack_forget()
+        self._draw_chart(self._last_entries)
+        self._populate_tree(self._last_entries)
+
+    def _redraw_chart(self):
+        if hasattr(self, "_last_entries"):
+            self._draw_chart(self._last_entries)
+
+    def _draw_chart(self, entries):
+        self._last_entries = entries
+        self.ax.clear()
+        self.ax.set_facecolor(BG)
+        self.fig.patch.set_facecolor(BG)
+
+        if not entries:
+            self.ax.set_visible(False)
+            self.fig.canvas.draw()
+            return
+        self.ax.set_visible(True)
+
+        by_sub = self._chart_group.get() == "subsource"
+
+        # Group by month (YYYY-MM) × chosen grouping
+        from collections import defaultdict
+        monthly: dict = defaultdict(lambda: defaultdict(float))
+        for e in entries:
+            month = e["entry_date"][:7]   # "YYYY-MM"
+            if by_sub:
+                label = e["subcategory"] or e["source"] or "Other"
+            else:
+                label = e["source"] or "Other"
+            monthly[month][label] += e["amount"]
+
+        months  = sorted(monthly.keys())
+        self._month_list = months
+        labels  = sorted({lbl for m in monthly.values() for lbl in m})
+
+        x      = range(len(months))
+        bottom = [0.0] * len(months)
+
+        _palette = [ACCENT, GREEN, YELLOW, MAUVE, TEAL, PINK, RED]
+        for i, lbl in enumerate(labels):
+            vals   = [monthly[m].get(lbl, 0.0) for m in months]
+            colour = _palette[i % len(_palette)]
+            alphas = [1.0 if (self._sel_month is None or m == self._sel_month) else 0.25
+                      for m in months]
+            for j, (v, b, a) in enumerate(zip(vals, bottom, alphas)):
+                self.ax.bar(j, v, bottom=b, color=colour,
+                            alpha=a, width=0.6,
+                            label=lbl if j == 0 else "_nolegend_")
+            bottom = [b + v for b, v in zip(bottom, vals)]
+
+        # X axis — show month labels
+        month_labels = []
+        for m in months:
+            try:
+                month_labels.append(
+                    datetime.datetime.strptime(m, "%Y-%m").strftime("%b %Y"))
+            except ValueError:
+                month_labels.append(m)
+
+        self.ax.set_xticks(list(x))
+        self.ax.set_xticklabels(month_labels, rotation=30, ha="right",
+                                color=SUBTEXT, fontsize=8)
+        self.ax.tick_params(axis="y", colors=SUBTEXT, labelsize=8)
+        self.ax.yaxis.set_major_formatter(
+            plt.FuncFormatter(lambda v, _: f"£{v:,.0f}"))
+        self.ax.spines[:].set_visible(False)
+        group_label = "sub-source" if by_sub else "source"
+        self.ax.set_title(f"Income by month · grouped by {group_label}",
+                          color=FG, fontsize=9, pad=6)
+
+        if labels:
+            self.ax.legend(fontsize=7, facecolor=BG2, labelcolor=FG,
+                           framealpha=0.8, loc="upper left")
+
+        self.fig.canvas.draw()
+
+    def _populate_tree(self, entries):
+        visible = [e for e in entries
+                   if self._sel_month is None or e["entry_date"][:7] == self._sel_month]
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        for i, entry in enumerate(visible):
+            self.tree.insert("", "end", iid=str(entry["id"]),
+                             values=(
+                                 format_date(entry["entry_date"]),
+                                 fmt_gbp(entry["amount"]),
+                                 entry["source"] or "—",
+                                 entry["subcategory"] or "—",
+                             ),
+                             tags=("even" if i % 2 == 0 else "odd",))
+        self.tree.tag_configure("even", background=BG2)
+        self.tree.tag_configure("odd",  background=BG)
+
+    def refresh(self):
+        entries = db.get_all_income()
+        self._draw_chart(entries)
+        self._populate_tree(entries)
+
+
+# ---------------------------------------------------------------------------
 # Main app window
 # ---------------------------------------------------------------------------
 
@@ -1431,9 +2618,11 @@ class FinanceApp(tk.Tk):
             ("snapshot",   "📝  Log Snapshot"),
             ("history",    "📈  History"),
             ("categories", "🗂   Categories"),
+            ("income",     "💷  Income"),
             ("interest",   "💰  Interest"),
             ("mortgage",   "🏠  Mortgage"),
-            ("accounts",   "⚙   Accounts"),
+            ("calced",     "🗃   Rec. Balances"),
+            ("settings",   "⚙   Settings"),
         ]
         for key, label in tabs:
             btn = tk.Button(nav, text=label, bg=BG2, fg=FG, activebackground=BG3,
@@ -1454,9 +2643,11 @@ class FinanceApp(tk.Tk):
             "snapshot":   SnapshotTab(self.container),
             "history":    HistoryTab(self.container),
             "categories": CategoriesTab(self.container),
+            "income":     IncomeTab(self.container),
             "interest":   InterestTab(self.container),
             "mortgage":   MortgageTab(self.container),
-            "accounts":   AccountsTab(self.container),
+            "calced":     CalcedBalancesTab(self.container),
+            "settings":   SettingsTab(self.container),
         }
 
     def _show_tab(self, key):

@@ -143,6 +143,47 @@ def init_db():
             for pt in ["Cash", "Current", "LISA", "Stocks & Shares ISA", "Savings", "Pension"]:
                 conn.execute("INSERT INTO account_product_types (name) VALUES (?)", (pt,))
 
+    # Settings table
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+
+    # Income tables
+    with get_conn() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS income_sources (
+                id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS income (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_date  TEXT NOT NULL,
+                amount      REAL NOT NULL,
+                source      TEXT,
+                subcategory TEXT,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        """)
+
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO settings (key, value) VALUES (?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, (key, value))
+
 
 # ---------------------------------------------------------------------------
 # Account helpers
@@ -233,10 +274,146 @@ def deactivate_account(account_id):
         conn.execute("UPDATE accounts SET is_active=0 WHERE id=?", (account_id,))
 
 
+def update_account_details(account_id: int, bank: str | None, account_type: str | None,
+                           account_name: str, product_type: str | None,
+                           max_balance_for_rate: float | None):
+    """Update the core editable fields on an account row."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE accounts SET bank=?, account_type=?, account_name=?,"
+            " product_type=?, max_balance_for_rate=? WHERE id=?",
+            (bank or None, account_type or None, account_name,
+             product_type or None, max_balance_for_rate, account_id),
+        )
+
+
 def update_account_product_type(account_id: int, product_type):
     with get_conn() as conn:
         conn.execute("UPDATE accounts SET product_type=? WHERE id=?",
                      (product_type, account_id))
+
+
+def update_account_category(account_id: int, category):
+    with get_conn() as conn:
+        conn.execute("UPDATE accounts SET category=? WHERE id=?",
+                     (category, account_id))
+
+
+def reactivate_account(account_id: int):
+    with get_conn() as conn:
+        conn.execute("UPDATE accounts SET is_active=1 WHERE id=?", (account_id,))
+
+
+def get_spending_category_names() -> list:
+    """Returns the list of spending category names in display order."""
+    with get_conn() as conn:
+        return [r["name"] for r in conn.execute(
+            "SELECT name FROM spending_categories ORDER BY id"
+        ).fetchall()]
+
+
+def get_all_allocations_on_date(date_str: str) -> dict:
+    """Returns {account_id: {cat_name: {"fixed": x, "pct": y}}} for all accounts as of date_str."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT aa.account_id, sc.name AS cat_name, aa.allocation, aa.fixed_amount
+            FROM account_allocations aa
+            JOIN spending_categories sc ON sc.id = aa.category_id
+            WHERE aa.effective_from = (
+                SELECT MAX(effective_from) FROM account_allocations
+                WHERE account_id = aa.account_id
+                  AND category_id = aa.category_id
+                  AND effective_from <= ?
+            )
+        """, (date_str,)).fetchall()
+    from collections import defaultdict
+    result: dict = defaultdict(dict)
+    for r in rows:
+        result[r["account_id"]][r["cat_name"]] = {
+            "fixed": r["fixed_amount"] or 0.0,
+            "pct": r["allocation"],
+        }
+    return dict(result)
+
+
+def get_category_account_breakdown(category_name: str) -> list:
+    """Drill-down: returns [{date, accounts: {acc_name: amount}}, ...]
+    showing each account's contribution to category_name over time.
+    Same fill-forward / inactive rules as get_category_history()."""
+    with get_conn() as conn:
+        cats = [r["name"] for r in conn.execute(
+            "SELECT name FROM spending_categories ORDER BY id").fetchall()]
+        dates = [r["snapshot_date"] for r in conn.execute("""
+            SELECT DISTINCT snapshot_date FROM balance_snapshots ORDER BY snapshot_date
+        """).fetchall()]
+        balance_rows = conn.execute("""
+            SELECT account_id, snapshot_date, balance FROM balance_snapshots
+            ORDER BY account_id, snapshot_date
+        """).fetchall()
+        alloc_rows = conn.execute("""
+            SELECT aa.account_id, sc.name AS cat_name,
+                   aa.allocation, aa.fixed_amount, aa.effective_from
+            FROM account_allocations aa
+            JOIN spending_categories sc ON sc.id = aa.category_id
+            ORDER BY aa.account_id, sc.name, aa.effective_from
+        """).fetchall()
+        accounts = conn.execute(
+            "SELECT id, account_name, is_active FROM accounts").fetchall()
+
+    from collections import defaultdict
+    active_ids = {r["id"] for r in accounts if r["is_active"]}
+    acc_names  = {r["id"]: r["account_name"] for r in accounts}
+
+    active_histories: dict = defaultdict(list)
+    date_snap: dict = defaultdict(dict)
+    for row in balance_rows:
+        date_snap[row["snapshot_date"]][row["account_id"]] = row["balance"]
+        if row["account_id"] in active_ids:
+            active_histories[row["account_id"]].append(
+                (row["snapshot_date"], row["balance"]))
+
+    alloc_timeline: dict = defaultdict(lambda: defaultdict(list))
+    for row in alloc_rows:
+        alloc_timeline[row["account_id"]][row["cat_name"]].append(
+            (row["effective_from"],
+             {"fixed": row["fixed_amount"] or 0.0, "pct": row["allocation"]}))
+
+    def _alloc(account_id, cat_name, date_str):
+        val = {"fixed": 0.0, "pct": 0.0}
+        for ef, a in alloc_timeline[account_id][cat_name]:
+            if ef <= date_str:
+                val = a
+            else:
+                break
+        return val
+
+    result = []
+    for date_str in dates:
+        snap = date_snap.get(date_str, {})
+        account_amounts = {}
+        for r in accounts:
+            acc_id = r["id"]
+            balance = (_last_known_balance(active_histories[acc_id], date_str)
+                       if r["is_active"] else snap.get(acc_id))
+            if not balance:
+                continue
+            allocs  = {cat: _alloc(acc_id, cat, date_str) for cat in cats}
+            amount  = calc_category_amounts(balance, allocs).get(category_name, 0.0)
+            if amount:
+                account_amounts[acc_names[acc_id]] = amount
+        if account_amounts:
+            result.append({"date": date_str, "accounts": account_amounts})
+    return result
+
+
+def get_last_recorded_dates() -> dict:
+    """Returns {account_id: last_snapshot_date} for all accounts."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT account_id, MAX(snapshot_date) AS last_date
+            FROM balance_snapshots GROUP BY account_id
+        """).fetchall()
+        return {r["account_id"]: r["last_date"] for r in rows}
 
 
 # ---------------------------------------------------------------------------
@@ -275,12 +452,23 @@ def get_allocations_on_date(account_id, on_date: str) -> dict:
 def calc_category_amounts(balance: float, allocs: dict) -> dict:
     """
     allocs: {cat_name: {"fixed": £amount, "pct": fraction_of_remainder}}
-    Fixed amounts are assigned first; remainder is split by pct.
+    Positive balance: fixed amounts assigned first, remainder split by pct.
+    Negative balance (debt): distributed proportionally by pct (fixed amounts
+    don't apply to debt), so the negative flows through to category totals.
     Returns {cat_name: £amount}.
     """
-    total_fixed = sum(v["fixed"] for v in allocs.values())
-    remainder = max(0.0, balance - total_fixed)
-    return {cat: v["fixed"] + remainder * v["pct"] for cat, v in allocs.items()}
+    if not allocs:
+        return {}
+    if balance >= 0:
+        total_fixed = sum(v["fixed"] for v in allocs.values())
+        remainder = max(0.0, balance - total_fixed)
+        return {cat: v["fixed"] + remainder * v["pct"] for cat, v in allocs.items()}
+    # Negative balance: split by pct weights so the debt reduces category totals
+    total_pct = sum(v["pct"] for v in allocs.values())
+    if total_pct > 0:
+        return {cat: balance * v["pct"] / total_pct for cat, v in allocs.items()}
+    n = len(allocs)
+    return {cat: balance / n for cat in allocs}
 
 
 def save_account_allocation(account_id: int, alloc_data: dict,
@@ -382,6 +570,18 @@ def get_latest_balance_per_account() -> dict:
         return {r["account_id"]: r["balance"] for r in rows}
 
 
+def _last_known_balance(sorted_history: list, date_str: str):
+    """Return the most recent balance on or before date_str from a sorted [(date, balance)] list.
+    Returns None if there is no recorded entry on or before that date."""
+    result = None
+    for d, b in sorted_history:
+        if d <= date_str:
+            result = b
+        else:
+            break
+    return result
+
+
 def get_snapshot_with_names(date_str: str) -> list:
     """Returns [{account_id, account_name, balance}] for a specific date, ordered by name."""
     with get_conn() as conn:
@@ -409,6 +609,15 @@ def delete_snapshot_entry(account_id: int, date_str: str):
         )
 
 
+def update_balance_entry(account_id: int, date_str: str, new_balance: float):
+    """Update the balance for a specific account / date entry."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE balance_snapshots SET balance=? WHERE account_id=? AND snapshot_date=?",
+            (new_balance, account_id, date_str)
+        )
+
+
 def get_balance_history(account_id):
     """Returns [(date, balance), ...] ordered chronologically."""
     with get_conn() as conn:
@@ -420,15 +629,93 @@ def get_balance_history(account_id):
 
 
 def get_net_worth_history():
-    """Returns [(date, total_balance), ...] ordered chronologically in one query."""
+    """Returns [(date, total_balance), ...].
+    Active accounts: fill-forward with last known balance.
+    Inactive accounts: only contribute on dates they have an actual entry."""
     with get_conn() as conn:
+        dates = [r["snapshot_date"] for r in conn.execute("""
+            SELECT DISTINCT snapshot_date FROM balance_snapshots ORDER BY snapshot_date
+        """).fetchall()]
+        accounts = conn.execute("SELECT id, is_active FROM accounts").fetchall()
         rows = conn.execute("""
-            SELECT snapshot_date, SUM(balance) AS total
-            FROM balance_snapshots
-            GROUP BY snapshot_date
-            ORDER BY snapshot_date
+            SELECT account_id, snapshot_date, balance FROM balance_snapshots
+            ORDER BY account_id, snapshot_date
         """).fetchall()
-        return [(r["snapshot_date"], r["total"]) for r in rows]
+
+    from collections import defaultdict
+    active_ids = {r["id"] for r in accounts if r["is_active"]}
+    active_histories: dict = defaultdict(list)
+    date_snap: dict = defaultdict(dict)  # {date: {account_id: balance}}
+
+    for r in rows:
+        date_snap[r["snapshot_date"]][r["account_id"]] = r["balance"]
+        if r["account_id"] in active_ids:
+            active_histories[r["account_id"]].append((r["snapshot_date"], r["balance"]))
+
+    result = []
+    for date_str in dates:
+        snap = date_snap.get(date_str, {})
+        total = 0.0
+        for r in accounts:
+            acc_id = r["id"]
+            if r["is_active"]:
+                bal = _last_known_balance(active_histories[acc_id], date_str)
+            else:
+                bal = snap.get(acc_id)   # None if no entry — no fill-forward
+            if bal is not None:
+                total += bal
+        result.append((date_str, total))
+    return result
+
+
+def _net_worth_history_filtered(positive_only: bool):
+    """Shared implementation for positive/debt-only history with fill-forward."""
+    with get_conn() as conn:
+        dates = [r["snapshot_date"] for r in conn.execute(
+            "SELECT DISTINCT snapshot_date FROM balance_snapshots ORDER BY snapshot_date"
+        ).fetchall()]
+        accounts = conn.execute("SELECT id, is_active FROM accounts").fetchall()
+        rows = conn.execute(
+            "SELECT account_id, snapshot_date, balance FROM balance_snapshots"
+            " ORDER BY account_id, snapshot_date"
+        ).fetchall()
+
+    from collections import defaultdict
+    active_ids = {r["id"] for r in accounts if r["is_active"]}
+    active_histories: dict = defaultdict(list)
+    date_snap: dict = defaultdict(dict)
+
+    for r in rows:
+        date_snap[r["snapshot_date"]][r["account_id"]] = r["balance"]
+        if r["account_id"] in active_ids:
+            active_histories[r["account_id"]].append((r["snapshot_date"], r["balance"]))
+
+    result = []
+    for date_str in dates:
+        snap = date_snap.get(date_str, {})
+        total = 0.0
+        for r in accounts:
+            acc_id = r["id"]
+            bal = (_last_known_balance(active_histories[acc_id], date_str)
+                   if r["is_active"] else snap.get(acc_id))
+            if bal is None:
+                continue
+            if positive_only and bal > 0:
+                total += bal
+            elif not positive_only and bal < 0:
+                total += bal   # keep negative for caller to abs()
+        result.append((date_str, total))
+    return result
+
+
+def get_assets_history():
+    """Dates × sum of positive balances only (true assets), fill-forward for active."""
+    return _net_worth_history_filtered(positive_only=True)
+
+
+def get_debt_history():
+    """Dates × sum of negative balances (debt), fill-forward for active. Values are negative."""
+    return _net_worth_history_filtered(positive_only=False)
 
 
 def get_all_balance_histories():
@@ -472,12 +759,11 @@ def get_category_history():
             SELECT DISTINCT snapshot_date FROM balance_snapshots ORDER BY snapshot_date
         """).fetchall()]
 
-        # All balances: {date: {account_id: balance}}
-        all_balances: dict = {}
-        for row in conn.execute(
-            "SELECT snapshot_date, account_id, balance FROM balance_snapshots"
-        ).fetchall():
-            all_balances.setdefault(row["snapshot_date"], {})[row["account_id"]] = row["balance"]
+        # Per-account sorted balance history for last-known-balance lookups
+        balance_rows = conn.execute("""
+            SELECT account_id, snapshot_date, balance FROM balance_snapshots
+            ORDER BY account_id, snapshot_date
+        """).fetchall()
 
         # All allocations sorted by effective_from so we can do a forward scan
         alloc_rows = conn.execute("""
@@ -488,10 +774,23 @@ def get_category_history():
             ORDER BY aa.account_id, sc.name, aa.effective_from
         """).fetchall()
 
-        account_ids = [r["id"] for r in conn.execute("SELECT id FROM accounts").fetchall()]
+        accounts = conn.execute("SELECT id, is_active FROM accounts").fetchall()
+
+    from collections import defaultdict
+
+    active_ids = {r["id"] for r in accounts if r["is_active"]}
+
+    # Per-active-account sorted history for fill-forward
+    active_histories: dict = defaultdict(list)
+    # Per-date snapshot for inactive accounts (actual entries only)
+    date_snap: dict = defaultdict(dict)
+
+    for row in balance_rows:
+        date_snap[row["snapshot_date"]][row["account_id"]] = row["balance"]
+        if row["account_id"] in active_ids:
+            active_histories[row["account_id"]].append((row["snapshot_date"], row["balance"]))
 
     # Build {account_id: {cat_name: [(effective_from, {fixed, pct}), ...]}} — already sorted
-    from collections import defaultdict
     alloc_timeline: dict = defaultdict(lambda: defaultdict(list))
     for row in alloc_rows:
         alloc_timeline[row["account_id"]][row["cat_name"]].append(
@@ -510,11 +809,15 @@ def get_category_history():
 
     result = []
     for date_str in dates:
-        snap = all_balances.get(date_str, {})
+        snap = date_snap.get(date_str, {})
         totals = {c: 0.0 for c in cats}
-        for acc_id in account_ids:
-            balance = snap.get(acc_id, 0.0)
-            if balance == 0.0:
+        for r in accounts:
+            acc_id = r["id"]
+            if r["is_active"]:
+                balance = _last_known_balance(active_histories[acc_id], date_str)
+            else:
+                balance = snap.get(acc_id)   # no fill-forward for inactive
+            if balance is None or balance == 0.0:
                 continue
             allocs = {cat: _alloc(acc_id, cat, date_str) for cat in cats}
             amounts = calc_category_amounts(balance, allocs)
@@ -546,7 +849,7 @@ def _get_rates_on_date(date_str: str) -> dict:
 def get_current_interest_summary():
     """Returns list of {account_name, balance, rate, yearly, daily} for active accounts."""
     date_str = datetime.date.today().isoformat()
-    _, snapshot = get_latest_snapshot()
+    snapshot = get_latest_balance_per_account()
     accounts = get_all_accounts()
     rates = _get_rates_on_date(date_str)
     result = []
@@ -570,7 +873,7 @@ def get_current_interest_summary():
 def project_balances(months: int):
     """Simple projection: apply current interest rates monthly for N months."""
     date_str = datetime.date.today().isoformat()
-    _, snapshot = get_latest_snapshot()
+    snapshot = get_latest_balance_per_account()
     accounts = get_all_accounts()
     rates = _get_rates_on_date(date_str)
     result = []
@@ -714,7 +1017,7 @@ def mortgage_estimate(
     net_monthly = net_annual / 12
 
     # --- Deposit ---
-    _, snapshot = get_latest_snapshot()
+    snapshot = get_latest_balance_per_account()
     accounts = get_all_accounts()
     today = datetime.date.today().isoformat()
     deposit_raw = 0.0
@@ -848,3 +1151,61 @@ def import_from_json(json_path: str):
             save_snapshot(date_str, balances)
 
     return len(data["accounts"]), len(data["snapshots"])
+
+
+# ---------------------------------------------------------------------------
+# Income
+# ---------------------------------------------------------------------------
+
+def get_income_sources() -> list[str]:
+    with get_conn() as conn:
+        return [r["name"] for r in
+                conn.execute("SELECT name FROM income_sources ORDER BY name").fetchall()]
+
+
+def get_income_sub_sources(source: str | None = None) -> list[str]:
+    """Return distinct subcategory values used under the given source (or all if None)."""
+    with get_conn() as conn:
+        if source:
+            rows = conn.execute(
+                "SELECT DISTINCT subcategory FROM income"
+                " WHERE source=? AND subcategory IS NOT NULL ORDER BY subcategory",
+                (source,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT subcategory FROM income"
+                " WHERE subcategory IS NOT NULL ORDER BY subcategory"
+            ).fetchall()
+    return [r["subcategory"] for r in rows]
+
+
+def add_income_source(name: str) -> None:
+    with get_conn() as conn:
+        conn.execute("INSERT OR IGNORE INTO income_sources (name) VALUES (?)", (name,))
+
+
+def add_income(entry_date: str, amount: float, source: str | None,
+               subcategory: str | None) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO income (entry_date, amount, source, subcategory) VALUES (?,?,?,?)",
+            (entry_date, amount, source or None, subcategory or None),
+        )
+        if source:
+            conn.execute("INSERT OR IGNORE INTO income_sources (name) VALUES (?)", (source,))
+        return cur.lastrowid
+
+
+def get_all_income() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, entry_date, amount, source, subcategory, created_at
+            FROM income ORDER BY entry_date DESC, id DESC
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_income(income_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM income WHERE id=?", (income_id,))
