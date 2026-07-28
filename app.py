@@ -158,14 +158,11 @@ class DashboardTab(tk.Frame):
         self._build()
 
     def _build(self):
-        # Header
+        # Header — Refresh only; add/deactivate live in the edit bar
         hdr = styled_frame(self)
         hdr.pack(fill="x", padx=20, pady=(16, 4))
         styled_label(hdr, "Dashboard", font=STYLE["font_h1"]).pack(side="left")
-        self._toggle_btn = styled_button(hdr, "⊗ Deactivate", self._deactivate, color=RED)
-        self._toggle_btn.pack(side="right")
         styled_button(hdr, "⟳ Refresh", self.refresh, color=GREEN).pack(side="right", padx=8)
-        styled_button(hdr, "+ Add Account", self._add_account, color=GREEN).pack(side="right", padx=8)
 
         # Summary cards (main row)
         self.cards_frame = styled_frame(self)
@@ -173,9 +170,12 @@ class DashboardTab(tk.Frame):
 
         # Category allocation cards (second row)
         self.cat_cards_frame = styled_frame(self)
-        self.cat_cards_frame.pack(fill="x", padx=20, pady=(0, 6))
+        self.cat_cards_frame.pack(fill="x", padx=20, pady=(0, 4))
 
-        # Edit bar — single row
+        # ---- Edit / Create bar ----
+        section_label(self, "  Account Editor  —  select a row to edit, or fill in fields to create").pack(
+            fill="x", padx=20, pady=(2, 0))
+
         edit_bar = tk.Frame(self, bg=BG2)
         edit_bar.pack(fill="x", padx=20, pady=(0, 6))
 
@@ -187,9 +187,10 @@ class DashboardTab(tk.Frame):
                             insertbackground=FG, relief="flat",
                             font=STYLE["font"], width=w)
 
-        self._sel_label = tk.Label(edit_bar, text="Select an account to edit",
+        # Status / name-preview label (left anchor)
+        self._sel_label = tk.Label(edit_bar, text="New account",
                                    bg=BG2, fg=SUBTEXT, font=STYLE["font"],
-                                   width=20, anchor="w")
+                                   width=22, anchor="w")
         self._sel_label.pack(side="left", padx=(10, 6), pady=6)
 
         tk.Frame(edit_bar, bg=BG3, width=1).pack(side="left", fill="y", pady=4)
@@ -213,16 +214,40 @@ class DashboardTab(tk.Frame):
         self._maxbal_var = tk.StringVar()
         _ent(self._maxbal_var, 10).pack(side="left", padx=(0, 8))
 
-        styled_button(edit_bar, "Save", self._save_edits, color=GREEN).pack(side="left")
+        # Save / Create button (text changes with mode)
+        self._save_btn = styled_button(edit_bar, "Create Account", self._save_edits, color=GREEN)
+        self._save_btn.pack(side="left")
+
+        # Deactivate/Reactivate — hidden until an account is selected
+        self._toggle_btn = styled_button(edit_bar, "⊗ Deactivate", self._deactivate, color=RED)
+        # not packed yet — shown in _on_select
+
+        # Unselect button — hidden until an account is selected
+        self._unselect_btn = tk.Button(
+            edit_bar, text="← Unselect", bg=BG3, fg=SUBTEXT,
+            relief="flat", font=STYLE["font"], padx=8, pady=3,
+            cursor="hand2", activebackground=BG2, activeforeground=FG,
+            command=self._clear_selection)
+        # not packed yet — shown in _on_select
 
         tk.Label(edit_bar, text="Rates & allocations → Log Snapshot",
                  bg=BG2, fg=SUBTEXT, font=STYLE["font"]).pack(side="right", padx=12)
 
+        # Live name preview while typing in create mode
+        for var in (self._bank_var, self._actype_var):
+            var.trace_add("write", lambda *_: self._update_create_preview())
+
         # Tree
         section_label(self, "  Current Balances").pack(fill="x", padx=20, pady=(4, 2))
-        tree_frame = styled_frame(self)
-        tree_frame.pack(fill="both", expand=True, padx=20, pady=(0, 16))
+        self._tree_frame = styled_frame(self)
+        self._tree_frame.pack(fill="both", expand=True, padx=20, pady=(0, 16))
+        self._build_tree()
 
+    def _build_tree(self):
+        for w in self._tree_frame.winfo_children():
+            w.destroy()
+
+        tree_frame = self._tree_frame
         self._spend_cats = db.get_spending_category_names()
         _cat_short = {"Spending": "Spending", "Deposit": "Deposit",
                       "Emergency Fund": "Emerg. Fund", "Long Term Savings": "LT Savings",
@@ -253,6 +278,11 @@ class DashboardTab(tk.Frame):
         self.tree.tag_configure("inactive", foreground=SUBTEXT)
 
         self.refresh()
+
+    def rebuild(self):
+        """Rebuild tree columns (called when spending categories change)."""
+        self._clear_selection()
+        self._build_tree()
 
     def _make_card(self, parent, label, value, colour, subtitle=None, subtitle_colour=None):
         f = tk.Frame(parent, bg=BG3, padx=16, pady=10)
@@ -452,6 +482,18 @@ class DashboardTab(tk.Frame):
             format_date(last_dt) if last_dt else "—",
         ) + cat_vals, tags=(tag,))
 
+    def _update_create_preview(self):
+        """Show a live name preview in the status label when in create (no selection) mode."""
+        if self._selected_id:
+            return
+        bank  = self._bank_var.get().strip()
+        label = self._actype_var.get().strip()
+        name  = f"{bank} - {label}" if bank and label else (bank or label)
+        if name:
+            self._sel_label.config(text=f"→ {name}", fg=ACCENT)
+        else:
+            self._sel_label.config(text="New account", fg=SUBTEXT)
+
     def _on_select(self, event):
         sel = self.tree.selection()
         if not sel or sel[0] == "__sep__":
@@ -459,7 +501,8 @@ class DashboardTab(tk.Frame):
         self._selected_id = int(sel[0])
         acc = db.get_account_by_id(self._selected_id)
         self._selected_active = bool(acc["is_active"])
-        self._sel_label.config(text="Editing:", fg=ACCENT)
+        acc_name = acc.get("account_name") or ""
+        self._sel_label.config(text=f"Editing: {acc_name}", fg=ACCENT)
         self._bank_var.set(acc.get("bank") or "")
         self._actype_var.set(acc.get("account_type") or "")
         self._pt_var.set(acc.get("product_type") or "")
@@ -469,30 +512,23 @@ class DashboardTab(tk.Frame):
         except (TypeError, ValueError):
             mb = None
         self._maxbal_var.set(f"{mb:.2f}" if mb is not None else "")
+        # Switch to edit mode
+        self._save_btn.config(text="Save Changes")
         if self._selected_active:
             self._toggle_btn.config(text="⊗ Deactivate", fg=RED, command=self._deactivate)
         else:
             self._toggle_btn.config(text="↺ Reactivate", fg=GREEN, command=self._reactivate)
-
-    def _add_type_inline(self):
-        name = simpledialog.askstring("New Account Type",
-                                      "Enter new account type name:", parent=self)
-        if name and name.strip():
-            db.add_product_type(name.strip())
-            self._pt_combo["values"] = db.get_product_types()
-            self._pt_var.set(name.strip())
+        self._toggle_btn.pack(side="left", padx=(8, 0))
+        self._unselect_btn.pack(side="left", padx=(6, 0))
 
     def _save_edits(self):
-        if not self._selected_id:
-            messagebox.showwarning("No selection", "Select an account first.")
-            return
         bank   = self._bank_var.get().strip()
         label  = self._actype_var.get().strip()
         ptype  = self._pt_var.get().strip()
         mb_raw = self._maxbal_var.get().strip().replace("£", "").replace(",", "")
 
         if not bank and not label:
-            messagebox.showwarning("Validation", "Bank or label cannot both be blank.")
+            messagebox.showwarning("Validation", "Bank and Label cannot both be blank.")
             return
         name = f"{bank} - {label}" if bank and label else (bank or label)
         try:
@@ -500,22 +536,47 @@ class DashboardTab(tk.Frame):
         except ValueError:
             messagebox.showwarning("Validation", "Rate Max £ must be a number.")
             return
-
         if ptype and ptype not in db.get_product_types():
             db.add_product_type(ptype)
             self._pt_combo["values"] = db.get_product_types()
 
-        try:
-            db.update_account_details(self._selected_id, bank or None, label or None,
-                                      name, ptype or None, max_bal)
-        except Exception as exc:
-            messagebox.showerror("Save failed", str(exc))
-            return
+        if self._selected_id:
+            # Update existing account
+            try:
+                db.update_account_details(self._selected_id, bank or None, label or None,
+                                          name, ptype or None, max_bal)
+            except Exception as exc:
+                messagebox.showerror("Save failed", str(exc))
+                return
+        else:
+            # Create new account
+            if not bank:
+                messagebox.showwarning("Validation", "Bank is required to create an account.")
+                return
+            if not label:
+                messagebox.showwarning("Validation", "Label is required to create an account.")
+                return
+            try:
+                db.upsert_account(
+                    account_name=name,
+                    bank=bank,
+                    account_type=label,
+                    category=None,
+                    max_balance_for_rate=max_bal,
+                    interest_rate=0.0,
+                    allocations={},
+                    effective_from=datetime.date.today().isoformat(),
+                    note=None,
+                    product_type=ptype or None,
+                )
+            except Exception as exc:
+                messagebox.showerror("Create failed", str(exc))
+                return
+        self._clear_selection()
         self.refresh()
 
     def _deactivate(self):
         if not self._selected_id:
-            messagebox.showwarning("No selection", "Select an account first.")
             return
         acc = db.get_account_by_id(self._selected_id)
         if messagebox.askyesno("Confirm", f"Deactivate '{acc['account_name']}'?\n"
@@ -537,15 +598,15 @@ class DashboardTab(tk.Frame):
     def _clear_selection(self):
         self._selected_id     = None
         self._selected_active = True
-        self._sel_label.config(text="Select an account to edit", fg=SUBTEXT)
+        self.tree.selection_remove(self.tree.selection())
+        self._sel_label.config(text="New account", fg=SUBTEXT)
         self._bank_var.set("")
         self._actype_var.set("")
         self._pt_var.set("")
         self._maxbal_var.set("")
-        self._toggle_btn.config(text="⊗ Deactivate", fg=RED, command=self._deactivate)
-
-    def _add_account(self):
-        AddAccountDialog(self, self.refresh)
+        self._save_btn.config(text="Create Account")
+        self._toggle_btn.pack_forget()
+        self._unselect_btn.pack_forget()
 
 
 # ---------------------------------------------------------------------------
@@ -556,8 +617,9 @@ class SnapshotTab(tk.Frame):
     """Single scrollable table — account rows × (balance, rate, one column per category).
     Category cells: type £500 for a fixed amount, 60% for remainder share."""
 
-    CATS     = ["Spending", "Deposit", "Emergency Fund", "Long Term Savings", "Pension"]
-    CAT_HDRS = ["Spending", "Deposit", "Emerg. Fund", "LT Savings", "Pension"]
+    _CAT_SHORT = {"Spending": "Spending", "Deposit": "Deposit",
+                  "Emergency Fund": "Emerg. Fund", "Long Term Savings": "LT Savings",
+                  "Pension": "Pension"}
 
     def __init__(self, parent):
         super().__init__(parent, bg=BG)
@@ -575,8 +637,8 @@ class SnapshotTab(tk.Frame):
         styled_label(hdr, "Log Balance Snapshot", font=STYLE["font_h1"]).pack(side="left")
         styled_button(hdr, "Save Snapshot", self._save, color=GREEN).pack(side="right")
         styled_button(hdr, "Delete Records", self._open_delete_dialog, color=RED).pack(side="right", padx=8)
-        styled_button(hdr, "Reset", self._reset, color=SUBTEXT).pack(side="right", padx=8)
-        styled_button(hdr, "Load Previous", self._load_previous, color=YELLOW).pack(side="right", padx=8)
+        styled_button(hdr, "Clear", self._reset, color=SUBTEXT).pack(side="right", padx=8)
+        styled_button(hdr, "⟳ Refresh", self._load_previous, color=GREEN).pack(side="right", padx=8)
 
         # Date + hint row
         date_row = styled_frame(self)
@@ -626,7 +688,13 @@ class SnapshotTab(tk.Frame):
     # Build / reset the table rows
     # ------------------------------------------------------------------
 
+    def rebuild(self):
+        """Rebuild after spending categories change."""
+        self._populate()
+
     def _populate(self):
+        self.CATS     = db.get_spending_category_names()
+        self.CAT_HDRS = [self._CAT_SHORT.get(c, c) for c in self.CATS]
         for w in self.inner.winfo_children():
             w.destroy()
         self._bal_vars    = {}
@@ -940,15 +1008,15 @@ class SnapshotTab(tk.Frame):
 # ---------------------------------------------------------------------------
 
 class HistoryTab(tk.Frame):
-    CATS = ["Spending", "Deposit", "Emergency Fund", "Long Term Savings", "Pension"]
-
     def __init__(self, parent):
         super().__init__(parent, bg=BG)
         self._time_range = db.get_setting("history_default_range", "ALL")
         self._drilldown  = None   # None = full view; str = single category drill-down
         self._hover_x    = []     # matplotlib date numbers for each data point
         self._hover_data = []     # [{"date": str, "values": {name: float}}, ...]
-        self._cids       = []     # matplotlib event connection IDs
+        self._cids           = []     # matplotlib event connection IDs
+        self._resize_job     = None
+        self._cat_stack_data = None   # (cats, x_vals, ys_mat) for click hit-test
         self._build()
 
     def _build(self):
@@ -992,7 +1060,7 @@ class HistoryTab(tk.Frame):
         self.canvas_widget.pack(fill="both", expand=True, padx=20, pady=(4, 16))
 
         self._update_range_styles()
-        self.refresh()
+        self.after_idle(self.refresh)
 
     # ---- State changes ----
 
@@ -1064,38 +1132,71 @@ class HistoryTab(tk.Frame):
             color=FG, fontsize=8, visible=False, zorder=10,
         )
 
-        # Capture the already-drawn background (annotation is invisible so not included)
-        self._bg = self.fig.canvas.copy_from_bbox(self.fig.bbox)
+        # Capture background only if canvas has a real size; defer if not yet laid out
+        if self.fig.bbox.width > 1:
+            self._bg = self.fig.canvas.copy_from_bbox(self.fig.bbox)
+        else:
+            self._bg = None
 
-        leg = self.ax.get_legend()
-        if leg:
-            for text in leg.get_texts():
-                text.set_picker(5)
-            for handle in leg.legend_handles:
-                if handle is not None:
-                    handle.set_picker(5)
+        def _on_resize(event):
+            # Invalidate immediately so hover returns early during drag
+            self._bg = None
+            self._annot.set_visible(False)
+            # Debounce: recapture after resize settles
+            if self._resize_job:
+                self.after_cancel(self._resize_job)
+            self._resize_job = self.after(150, _recapture_bg)
+
+        def _recapture_bg():
+            self._resize_job = None
+            self.fig.canvas.draw()
+            self._bg = self.fig.canvas.copy_from_bbox(self.fig.bbox)
 
         self._cids.append(
-            self.fig.canvas.mpl_connect("pick_event", self._on_pick))
+            self.fig.canvas.mpl_connect("resize_event", _on_resize))
+
+        self._cids.append(
+            self.fig.canvas.mpl_connect("button_press_event", self._on_click))
         self._cids.append(
             self.fig.canvas.mpl_connect("motion_notify_event", self._on_hover))
 
-    def _on_pick(self, event):
+    def _hit_test_category(self, xdata, ydata):
+        """Return the category name at (xdata, ydata) in the stacked chart, or None."""
+        if not self._cat_stack_data:
+            return None
+        cats, x_vals, ys_mat = self._cat_stack_data
+        if not x_vals:
+            return None
+        idx = min(range(len(x_vals)), key=lambda i: abs(x_vals[i] - xdata))
+        has_pos = {n for n, ys in zip(cats, ys_mat) if any(v > 0 for v in ys)}
+        has_neg = {n for n, ys in zip(cats, ys_mat) if any(v < 0 for v in ys)}
+        pos_cum = 0.0
+        neg_cum = 0.0
+        for cat, ys in zip(cats, ys_mat):
+            pos_val = max(0.0, ys[idx]) if cat in has_pos else 0.0
+            neg_val = min(0.0, ys[idx]) if cat in has_neg else 0.0
+            if pos_val > 0 and pos_cum <= ydata <= pos_cum + pos_val:
+                return cat
+            pos_cum += pos_val
+            if neg_val < 0 and neg_cum + neg_val <= ydata <= neg_cum:
+                return cat
+            neg_cum += neg_val
+        return None
+
+    def _on_click(self, event):
         if self.mode.get() != "By Category" or self._drilldown:
             return
-        leg = self.ax.get_legend()
-        if not leg:
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
             return
-        for text, handle in zip(leg.get_texts(), leg.legend_handles):
-            if event.artist in (text, handle):
-                cat_name = text.get_text()
-                if cat_name in self.CATS:
-                    self._set_drilldown(cat_name)
-                return
+        cat = self._hit_test_category(event.xdata, event.ydata)
+        if cat:
+            self._set_drilldown(cat)
 
     def _on_hover(self, event):
         if not hasattr(self, "_annot") or not self._hover_x or self._bg is None:
             return
+
+        tk_widget = self.fig.canvas.get_tk_widget()
 
         def _blit_hide():
             self._annot.set_visible(False)
@@ -1105,7 +1206,14 @@ class HistoryTab(tk.Frame):
         if event.inaxes != self.ax or event.xdata is None:
             if self._annot.get_visible():
                 _blit_hide()
+            tk_widget.config(cursor="")
             return
+
+        # Show hand cursor when hovering a clickable category band
+        clickable = (self.mode.get() == "By Category" and not self._drilldown
+                     and event.ydata is not None
+                     and self._hit_test_category(event.xdata, event.ydata) is not None)
+        tk_widget.config(cursor="hand2" if clickable else "")
 
         idx    = min(range(len(self._hover_x)),
                      key=lambda i: abs(self._hover_x[i] - event.xdata))
@@ -1136,8 +1244,9 @@ class HistoryTab(tk.Frame):
     # ---- Refresh ----
 
     def refresh(self):
-        self._hover_x    = []
-        self._hover_data = []
+        self._hover_x        = []
+        self._hover_data     = []
+        self._cat_stack_data = None
         self.ax.clear()
         self.ax.set_facecolor(BG2)
         self.fig.patch.set_facecolor(BG)
@@ -1251,17 +1360,19 @@ class HistoryTab(tk.Frame):
         history = self._trim(db.get_category_history(),
                              date_fn=lambda h: h["date"])
         if not history:
+            self._cat_stack_data = None
             return
         cats    = list(history[0]["totals"].keys())
         x       = self._dates_to_mpl([h["date"] for h in history])
         ys_mat  = [[h["totals"].get(cat, 0.0) for h in history] for cat in cats]
         colours = [CAT_COLOURS.get(cat, SUBTEXT) for cat in cats]
         self._signed_stackplot(x, cats, ys_mat, colours)
+        self._cat_stack_data = (cats, list(x), ys_mat)
         self._hover_x    = list(x)
         self._hover_data = [{"date": h["date"], "values": dict(h["totals"])}
                             for h in history]
         self.ax.set_title(
-            "Balance by Spending Category  ·  click a legend entry to drill down",
+            "Balance by Spending Category  ·  click a section to drill down",
             color=FG, pad=10)
 
     def _plot_category_drilldown(self, cat_name):
@@ -1288,8 +1399,9 @@ class HistoryTab(tk.Frame):
 # ---------------------------------------------------------------------------
 
 class CategoriesTab(tk.Frame):
-    def __init__(self, parent):
+    def __init__(self, parent, on_change=None):
         super().__init__(parent, bg=BG)
+        self._on_change = on_change
         self._build()
 
     def _build(self):
@@ -1297,6 +1409,21 @@ class CategoriesTab(tk.Frame):
         hdr.pack(fill="x", padx=20, pady=(16, 4))
         styled_label(hdr, "Category Breakdown", font=STYLE["font_h1"]).pack(side="left")
         styled_button(hdr, "⟳ Refresh", self.refresh, color=GREEN).pack(side="right")
+
+        # Manage categories
+        manage = tk.Frame(self, bg=BG2)
+        manage.pack(fill="x", padx=20, pady=(0, 6))
+        tk.Label(manage, text="Add category:", bg=BG2, fg=SUBTEXT,
+                 font=STYLE["font"]).pack(side="left", padx=(10, 4), pady=6)
+        self._new_cat_var = tk.StringVar()
+        tk.Entry(manage, textvariable=self._new_cat_var, bg=BG3, fg=FG,
+                 insertbackground=FG, relief="flat",
+                 font=STYLE["font"], width=18).pack(side="left", padx=(0, 6))
+        styled_button(manage, "+ Add", self._add_category, color=GREEN).pack(side="left")
+
+        self._cat_list_frame = tk.Frame(self, bg=BG)
+        self._cat_list_frame.pack(fill="x", padx=20, pady=(0, 4))
+        self._rebuild_cat_list()
 
         # Latest snapshot summary
         section_label(self, "  Current Allocation").pack(fill="x", padx=20, pady=(8, 2))
@@ -1323,6 +1450,46 @@ class CategoriesTab(tk.Frame):
         self.canvas_widget.pack(fill="both", expand=True, padx=20, pady=(0, 16))
 
         self.refresh()
+
+    def _rebuild_cat_list(self):
+        for w in self._cat_list_frame.winfo_children():
+            w.destroy()
+        cats = db.get_spending_categories()
+        row = tk.Frame(self._cat_list_frame, bg=BG)
+        row.pack(fill="x")
+        for cat in cats:
+            chip = tk.Frame(row, bg=BG3, padx=6, pady=2)
+            chip.pack(side="left", padx=(0, 6), pady=2)
+            tk.Label(chip, text=cat["name"], bg=BG3, fg=FG,
+                     font=STYLE["font"]).pack(side="left")
+            tk.Button(chip, text="✕", bg=BG3, fg=RED,
+                      activebackground=BG2, activeforeground=RED,
+                      relief="flat", font=STYLE["font"], cursor="hand2",
+                      command=lambda cid=cat["id"], cname=cat["name"]: self._delete_category(cid, cname)
+                      ).pack(side="left", padx=(4, 0))
+
+    def _add_category(self):
+        name = self._new_cat_var.get().strip()
+        if not name:
+            return
+        db.add_spending_category(name)
+        self._new_cat_var.set("")
+        self._rebuild_cat_list()
+        self.refresh()
+        if self._on_change:
+            self._on_change()
+
+    def _delete_category(self, cat_id: int, cat_name: str):
+        if not messagebox.askyesno(
+            "Remove category",
+            f"Remove '{cat_name}'?\n\nAll allocation rules for this category will also be deleted.",
+        ):
+            return
+        db.delete_spending_category(cat_id)
+        self._rebuild_cat_list()
+        self.refresh()
+        if self._on_change:
+            self._on_change()
 
     def refresh(self):
         for row in self.tree.get_children():
@@ -1456,206 +1623,711 @@ class InterestTab(tk.Frame):
 # Tab 6 — Mortgage
 # ---------------------------------------------------------------------------
 
-DEFAULT_EXPENSES = {
-    "Food + Essentials":  350.0,
-    "Fun":                500.0,
-    "Utility":             80.0,
-    "Wifi":                25.0,
-    "Holidays":           250.0,
-    "Savings":            250.0,
-    "Home Insurance":      25.0,
-    "Transport + Car":    150.0,
-    "Council Tax Band C": 200.0,
-    "AI":                  20.0,
-    "Monzo Max":           17.0,
-    "Climbing Gym":        39.0,
-    "Emergency Fund":     200.0,
-}
-
 class MortgageTab(tk.Frame):
+    # (key, display label, hint text, pct flag)
+    _FIXED_FIELDS = [
+        ("income",  "Annual salary (£):",        "e.g. 35 000",  False),
+        ("bonus",   "Annual bonus (£):",          "e.g. 0",       False),
+        ("pension", "Pension contribution (%):",  "e.g. 5",       True),
+    ]
+    _PROP_FIELDS = [
+        ("price",   "Property price (£):",        "e.g. 200 000", False),
+        ("overbid", "Over-bid rate (%):",          "e.g. 5",       True),
+        ("fees",    "Fees & moving costs (£):",    "e.g. 5 000",   False),
+        ("term",    "Mortgage term (years):",      "e.g. 25",      False),
+        ("boe",     "BoE base rate (%):",          "e.g. 4.5",     True),
+    ]
+
     def __init__(self, parent):
         super().__init__(parent, bg=BG)
-        self._expense_vars = {}
+        self._fixed_vars      = {}   # key → StringVar
+        self._fixed_hints     = {}   # key → hint string
+        self._fixed_entries   = {}   # key → Entry widget
+        self._income_items    = []   # [{label_var, amount_var, frame}]
+        self._expense_items   = []   # [{label_var, amount_var, frame}]
+        self._left_canvas     = None
+        self._deposit_mode    = tk.StringVar(value="category")
+        self._deposit_cat_var = tk.StringVar()
+        self._deposit_custom_var = tk.StringVar()
+        self._deposit_cat_combo  = None
+        self._deposit_custom_ent = None
+        self._results_fig        = None   # matplotlib figure; closed before recreating
+        self._calc_state         = None   # stores last calc inputs for what-if
+        self._wi_dep_var         = None   # set in _build_whatif_sliders
+        self._wi_sal_var         = None
+        self._wi_dep_lbl         = None
+        self._wi_sal_lbl         = None
+        self._wi_dep_scale       = None
+        self._wi_updating        = False  # guard against recursive slider traces
         self._build()
+
+    # ---- Placeholder helper ----
+
+    @staticmethod
+    def _hint_entry(entry, var, hint):
+        """Attach greyed placeholder text to an Entry that uses a StringVar."""
+        def _show():
+            if not var.get():
+                var.set(hint)
+                entry.config(fg=SUBTEXT)
+
+        def _focus_in(_):
+            if var.get() == hint:
+                var.set("")
+                entry.config(fg=FG)
+
+        def _focus_out(_):
+            if not var.get():
+                _show()
+            else:
+                entry.config(fg=FG)
+
+        entry.bind("<FocusIn>",  _focus_in)
+        entry.bind("<FocusOut>", _focus_out)
+        _show()
+
+    # ---- Layout ----
 
     def _build(self):
         hdr = styled_frame(self)
         hdr.pack(fill="x", padx=20, pady=(16, 4))
         styled_label(hdr, "Mortgage Calculator", font=STYLE["font_h1"]).pack(side="left")
-        styled_button(hdr, "⟳ Calculate", self._calc, color=GREEN).pack(side="right")
 
-        # Two-column layout: inputs left, results right
         body = styled_frame(self)
         body.pack(fill="both", expand=True, padx=20, pady=(0, 12))
 
-        # ---- LEFT: inputs ----
-        left = styled_frame(body)
-        left.pack(side="left", fill="y", padx=(0, 16))
+        # ---- LEFT: scrollable inputs ----
+        left_outer = styled_frame(body)
+        left_outer.pack(side="left", fill="y", padx=(0, 16))
 
+        lc = tk.Canvas(left_outer, bg=BG, highlightthickness=0, width=330)
+        lsb = ttk.Scrollbar(left_outer, orient="vertical", command=lc.yview)
+        left = tk.Frame(lc, bg=BG)
+        left.bind("<Configure>", lambda e: lc.configure(scrollregion=lc.bbox("all")))
+        lc.create_window((0, 0), window=left, anchor="nw")
+        lc.configure(yscrollcommand=lsb.set)
+        lc.pack(side="left", fill="y", expand=False)
+        lsb.pack(side="right", fill="y")
+        lc.bind("<MouseWheel>", lambda e: lc.yview_scroll(-1*(e.delta//120), "units"))
+        self._left_canvas = lc
+
+        # Fixed income
         section_label(left, "Income").pack(anchor="w", pady=(4, 2))
-        self._inputs = {}
-        income_fields = [
-            ("Annual salary (£):",       "income",    "32500"),
-            ("Annual bonus (£):",         "bonus",     "605"),
-            ("Pension contribution (%):", "pension",   "6"),
-            ("Lodger income (£/mo):",     "lodger",    "525"),
-        ]
-        for label, key, default in income_fields:
-            self._input_row(left, label, key, default)
+        for key, lbl, hint, _ in self._FIXED_FIELDS:
+            self._fixed_row(left, key, lbl, hint)
 
+        # Property
         section_label(left, "Property").pack(anchor="w", pady=(10, 2))
-        property_fields = [
-            ("Property price (£):",       "price",     "200000"),
-            ("Over-bid rate (%):",         "overbid",   "5"),
-            ("Fees & moving costs (£):",   "fees",      "5000"),
-            ("Mortgage term (years):",     "term",      "20"),
-            ("BoE base rate (%):",         "boe",       "3.75"),
-        ]
-        for label, key, default in property_fields:
-            self._input_row(left, label, key, default)
+        for key, lbl, hint, _ in self._PROP_FIELDS:
+            self._fixed_row(left, key, lbl, hint)
 
-        section_label(left, "Monthly Expenses").pack(anchor="w", pady=(10, 2))
-        for name, default in DEFAULT_EXPENSES.items():
-            row = styled_frame(left)
-            row.pack(fill="x", pady=1)
-            tk.Label(row, text=name + ":", bg=BG, fg=FG, font=STYLE["font"],
-                     width=24, anchor="w").pack(side="left")
-            var = tk.StringVar(value=str(default))
-            styled_entry(row, width=8, textvariable=var).pack(side="left", padx=4)
-            self._expense_vars[name] = var
+        # Deposit source
+        section_label(left, "Deposit").pack(anchor="w", pady=(10, 2))
+        self._build_deposit_section(left)
 
-        # ---- RIGHT: results (scrollable) ----
+        # Dynamic monthly income
+        inc_hdr = styled_frame(left)
+        inc_hdr.pack(fill="x", pady=(10, 2))
+        section_label(inc_hdr, "Monthly Income").pack(side="left")
+        tk.Button(inc_hdr, text="+ Add", bg=BG3, fg=GREEN, relief="flat",
+                  font=STYLE["font"], padx=6, pady=1, cursor="hand2",
+                  activebackground=BG2, activeforeground=GREEN,
+                  command=self._add_income_row).pack(side="right")
+        self._income_list_frame = tk.Frame(left, bg=BG)
+        self._income_list_frame.pack(fill="x")
+
+        # Dynamic monthly expenses
+        exp_hdr = styled_frame(left)
+        exp_hdr.pack(fill="x", pady=(10, 2))
+        section_label(exp_hdr, "Monthly Expenses").pack(side="left")
+        tk.Button(exp_hdr, text="+ Add", bg=BG3, fg=GREEN, relief="flat",
+                  font=STYLE["font"], padx=6, pady=1, cursor="hand2",
+                  activebackground=BG2, activeforeground=GREEN,
+                  command=self._add_expense_row).pack(side="right")
+        self._expense_list_frame = tk.Frame(left, bg=BG)
+        self._expense_list_frame.pack(fill="x")
+
+        # Calculate button
+        styled_button(left, "Save & Calculate", self._calc, color=GREEN).pack(
+            anchor="w", pady=(16, 8))
+
+        # ---- RIGHT: what-if sliders (fixed) + scrollable results ----
         right_outer = styled_frame(body)
         right_outer.pack(side="left", fill="both", expand=True)
 
-        canvas = tk.Canvas(right_outer, bg=BG, highlightthickness=0)
-        sb = ttk.Scrollbar(right_outer, orient="vertical", command=canvas.yview)
-        self._results = styled_frame(canvas)
-        self._results.bind("<Configure>", lambda e: canvas.configure(
-            scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self._results, anchor="nw")
-        canvas.configure(yscrollcommand=sb.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(-1*(e.delta//120), "units"))
+        # Slider panel — lives above the scroll area and is never destroyed
+        self._wi_frame = tk.Frame(right_outer, bg=BG2)
+        self._wi_frame.pack(fill="x")
+        self._build_whatif_sliders()
 
-        self._calc()
+        # Scrollable results below
+        rc_wrap = tk.Frame(right_outer, bg=BG)
+        rc_wrap.pack(fill="both", expand=True)
+        rc = tk.Canvas(rc_wrap, bg=BG, highlightthickness=0)
+        rsb = ttk.Scrollbar(rc_wrap, orient="vertical", command=rc.yview)
+        self._results = styled_frame(rc)
+        self._results.bind("<Configure>", lambda e: rc.configure(scrollregion=rc.bbox("all")))
+        rc.create_window((0, 0), window=self._results, anchor="nw")
+        rc.configure(yscrollcommand=rsb.set)
+        rc.pack(side="left", fill="both", expand=True)
+        rsb.pack(side="right", fill="y")
+        rc.bind_all("<MouseWheel>", lambda e: rc.yview_scroll(-1*(e.delta//120), "units"))
 
-    def _input_row(self, parent, label, key, default):
+        self._load_from_db()
+        self.after_idle(self._calc)
+
+    def _fixed_row(self, parent, key, label, hint):
         row = styled_frame(parent)
         row.pack(fill="x", pady=1)
         tk.Label(row, text=label, bg=BG, fg=FG, font=STYLE["font"],
                  width=24, anchor="w").pack(side="left")
-        var = tk.StringVar(value=default)
-        styled_entry(row, width=10, textvariable=var).pack(side="left", padx=4)
-        self._inputs[key] = var
+        var = tk.StringVar()
+        ent = styled_entry(row, width=10, textvariable=var)
+        ent.pack(side="left", padx=4)
+        self._hint_entry(ent, var, hint)
+        self._fixed_vars[key]   = var
+        self._fixed_hints[key]  = hint
+        self._fixed_entries[key] = ent
 
-    def _flt(self, key, pct=False):
-        val = float(self._inputs[key].get().replace(",","").replace("£","").replace("%",""))
+    def _build_deposit_section(self, parent):
+        cats = db.get_spending_category_names()
+
+        # Row 1: "From category" radio + combobox + live amount
+        r1 = tk.Frame(parent, bg=BG)
+        r1.pack(fill="x", pady=1)
+        tk.Radiobutton(r1, text="From category:", variable=self._deposit_mode, value="category",
+                       bg=BG, fg=FG, selectcolor=BG3, activebackground=BG, font=STYLE["font"],
+                       command=self._on_deposit_mode_change).pack(side="left")
+        self._deposit_cat_combo = ttk.Combobox(r1, textvariable=self._deposit_cat_var,
+                                               values=cats, state="readonly", width=14,
+                                               font=STYLE["font"])
+        self._deposit_cat_combo.pack(side="left", padx=6)
+        if cats and not self._deposit_cat_var.get():
+            self._deposit_cat_var.set(cats[0])
+
+        self._deposit_amount_label = tk.Label(r1, text="", bg=BG, fg=GREEN,
+                                              font=STYLE["font_mono"])
+        self._deposit_amount_label.pack(side="left", padx=(2, 0))
+
+        # Row 2: "Custom amount" radio + entry
+        r2 = tk.Frame(parent, bg=BG)
+        r2.pack(fill="x", pady=1)
+        tk.Radiobutton(r2, text="Custom amount (£):", variable=self._deposit_mode, value="custom",
+                       bg=BG, fg=FG, selectcolor=BG3, activebackground=BG, font=STYLE["font"],
+                       command=self._on_deposit_mode_change).pack(side="left")
+        self._deposit_custom_ent = styled_entry(r2, width=10, textvariable=self._deposit_custom_var)
+        self._deposit_custom_ent.pack(side="left", padx=4)
+        self._hint_entry(self._deposit_custom_ent, self._deposit_custom_var, "e.g. 20 000")
+
+        self._deposit_cat_var.trace_add("write", lambda *_: self._update_deposit_preview())
+        self._on_deposit_mode_change()
+
+    def _update_deposit_preview(self):
+        if not hasattr(self, "_deposit_amount_label"):
+            return
+        if self._deposit_mode.get() != "category":
+            self._deposit_amount_label.config(text="")
+            return
+        cat = self._deposit_cat_var.get()
+        if not cat:
+            self._deposit_amount_label.config(text="")
+            return
+        try:
+            total = db.get_category_current_total(cat)
+            self._deposit_amount_label.config(text=fmt_gbp(total))
+        except Exception:
+            self._deposit_amount_label.config(text="")
+
+    def _on_deposit_mode_change(self):
+        is_cat = self._deposit_mode.get() == "category"
+        if self._deposit_cat_combo:
+            self._deposit_cat_combo.config(state="readonly" if is_cat else "disabled")
+        if self._deposit_custom_ent:
+            self._deposit_custom_ent.config(state="normal" if not is_cat else "disabled")
+        self._update_deposit_preview()
+
+    def refresh_categories(self):
+        """Called when spending categories are added or removed."""
+        if not self._deposit_cat_combo:
+            return
+        cats    = db.get_spending_category_names()
+        current = self._deposit_cat_var.get()
+        self._deposit_cat_combo.config(values=cats)
+        if current not in cats:
+            self._deposit_cat_var.set(cats[0] if cats else "")
+        self._update_deposit_preview()
+
+    def _dynamic_row(self, parent, item_list, label="", amount=""):
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill="x", pady=1)
+        label_var  = tk.StringVar()
+        amount_var = tk.StringVar()
+        lbl_ent = styled_entry(row, width=16, textvariable=label_var)
+        lbl_ent.pack(side="left")
+        amt_ent = styled_entry(row, width=8, textvariable=amount_var)
+        amt_ent.pack(side="left", padx=4)
+        self._hint_entry(lbl_ent, label_var, "Label")
+        self._hint_entry(amt_ent, amount_var, "£/mo")
+        # Set real values after hints are wired (bypasses the empty-check)
+        if label:
+            label_var.set(label)
+            lbl_ent.config(fg=FG)
+        if amount:
+            amount_var.set(str(amount))
+            amt_ent.config(fg=FG)
+        entry = {"label_var": label_var, "amount_var": amount_var,
+                 "frame": row, "lbl_ent": lbl_ent, "amt_ent": amt_ent}
+
+        def _delete(e=entry, r=row):
+            item_list.remove(e)
+            r.destroy()
+
+        tk.Button(row, text="×", bg=BG3, fg=RED, relief="flat",
+                  font=STYLE["font"], padx=4, cursor="hand2",
+                  activebackground=BG2, activeforeground=RED,
+                  command=_delete).pack(side="left")
+        item_list.append(entry)
+
+    def _add_income_row(self, label="", amount=""):
+        self._dynamic_row(self._income_list_frame, self._income_items, label, amount)
+        if self._left_canvas:
+            self._left_canvas.yview_moveto(1.0)
+
+    def _add_expense_row(self, label="", amount=""):
+        self._dynamic_row(self._expense_list_frame, self._expense_items, label, amount)
+        if self._left_canvas:
+            self._left_canvas.yview_moveto(1.0)
+
+    # ---- DB load / save ----
+
+    def _load_from_db(self):
+        fixed = db.get_mortgage_fixed()
+        for key, var in self._fixed_vars.items():
+            if key in fixed and fixed[key] != 0.0:
+                var.set(str(fixed[key]))
+                if key in self._fixed_entries:
+                    self._fixed_entries[key].config(fg=FG)
+
+        # Deposit settings
+        mode = db.get_setting("mortgage_deposit_mode", "category")
+        self._deposit_mode.set(mode)
+        cat = db.get_setting("mortgage_deposit_category", "")
+        if cat:
+            self._deposit_cat_var.set(cat)
+        fixed_all = db.get_mortgage_fixed()
+        if "deposit_custom" in fixed_all:
+            self._deposit_custom_var.set(str(fixed_all["deposit_custom"]))
+        self._on_deposit_mode_change()
+
+        for item in db.get_mortgage_income_items():
+            self._add_income_row(item["label"], item["amount"])
+        for item in db.get_mortgage_expense_items():
+            self._add_expense_row(item["label"], item["amount"])
+
+        self._update_deposit_preview()
+
+    def _parse_fixed(self, key, pct=False):
+        raw = self._fixed_vars[key].get()
+        if raw == self._fixed_hints.get(key, ""):
+            raw = ""
+        raw = raw.replace(",", "").replace("£", "").replace("%", "").replace(" ", "").strip()
+        val = float(raw) if raw else 0.0
         return val / 100 if pct else val
 
-    def _calc(self):
-        for w in self._results.winfo_children():
-            w.destroy()
+    def _read_dynamic_item(self, item):
+        """Return (label, amount) stripping placeholder hints."""
+        lbl = item["label_var"].get()
+        if lbl == "Label":
+            lbl = ""
+        raw = item["amount_var"].get()
+        if raw == "£/mo":
+            raw = ""
+        raw = raw.replace(",", "").replace("£", "").replace(" ", "").strip()
+        amt = float(raw) if raw else 0.0
+        return lbl, amt
 
+    def _save_to_db(self):
+        fixed_data = {k: self._parse_fixed(k) for k in self._fixed_vars}
+
+        # Deposit custom amount
+        dep_raw = self._deposit_custom_var.get()
+        if dep_raw != "e.g. 20 000":
+            dep_raw = dep_raw.replace(",", "").replace("£", "").replace(" ", "").strip()
+            try:
+                fixed_data["deposit_custom"] = float(dep_raw) if dep_raw else 0.0
+            except ValueError:
+                pass
+        db.save_mortgage_fixed(fixed_data)
+        db.set_setting("mortgage_deposit_mode",     self._deposit_mode.get())
+        db.set_setting("mortgage_deposit_category", self._deposit_cat_var.get())
+
+        income_items = []
+        for item in self._income_items:
+            lbl, amt = self._read_dynamic_item(item)
+            income_items.append({"label": lbl, "amount": amt})
+        db.save_mortgage_income_items(income_items)
+
+        expense_items = []
+        for item in self._expense_items:
+            lbl, amt = self._read_dynamic_item(item)
+            expense_items.append({"label": lbl, "amount": amt})
+        db.save_mortgage_expense_items(expense_items)
+
+    # ---- What-if sliders ----
+
+    def _build_whatif_sliders(self):
+        p = self._wi_frame
+        section_label(p, "What-if Explorer").pack(anchor="w", padx=14, pady=(8, 4))
+
+        self._wi_dep_var = tk.IntVar(value=0)
+        self._wi_sal_var = tk.IntVar(value=0)
+
+        def _row(parent, label, var):
+            row = tk.Frame(parent, bg=BG2)
+            row.pack(fill="x", padx=14, pady=3)
+            tk.Label(row, text=label, bg=BG2, fg=SUBTEXT, font=STYLE["font"],
+                     width=16, anchor="w").pack(side="left")
+            # Track in a contrasting frame so the trough is clearly visible
+            track_frame = tk.Frame(row, bg="#0e1e2e", bd=1, relief="solid")
+            track_frame.pack(side="left", fill="x", expand=True, padx=(6, 8))
+            sl = tk.Scale(track_frame, variable=var, from_=0, to=100_000,
+                          resolution=500, orient="horizontal",
+                          bg="#0e1e2e", fg=ACCENT, troughcolor="#1e3a50",
+                          highlightthickness=0, showvalue=0,
+                          activebackground=GREEN, sliderrelief="flat",
+                          sliderlength=22, bd=0, width=12)
+            sl.pack(fill="x")
+            val_lbl = tk.Label(row, bg=BG2, fg=ACCENT,
+                               font=STYLE["font_bold"], width=12, anchor="w")
+            val_lbl.pack(side="left")
+            return sl, val_lbl
+
+        self._wi_dep_scale, self._wi_dep_lbl = _row(p, "Extra deposit:", self._wi_dep_var)
+        self._wi_sal_scale, self._wi_sal_lbl = _row(p, "Extra salary:",  self._wi_sal_var)
+        self._wi_dep_lbl.config(text="£0")
+        self._wi_sal_lbl.config(text="£0")
+
+        tk.Frame(p, bg=BG3, height=1).pack(fill="x", pady=(8, 0))
+
+        self._wi_dep_var.trace_add("write", lambda *_: self._on_whatif_change())
+        self._wi_sal_var.trace_add("write", lambda *_: self._on_whatif_change())
+
+    def _on_whatif_change(self):
+        if self._calc_state is None or self._wi_updating:
+            return
+        cs   = self._calc_state
+        xdep = self._wi_dep_var.get()
+        xsal = self._wi_sal_var.get()
+
+        self._wi_dep_lbl.config(text=f"+£{xdep:,}" if xdep else "£0")
+        self._wi_sal_lbl.config(text=f"+£{xsal:,}" if xsal else "£0")
+
+        r_adj = db.mortgage_estimate(
+            annual_income        = cs["income"] + xsal,
+            bonus                = cs["bonus"],
+            pension_pct          = cs["pension"],
+            extra_monthly_income = cs["extra_monthly"],
+            property_price       = cs["price"],
+            overbid_rate         = cs["overbid"],
+            fees                 = cs["r"]["fees"],
+            boe_rate             = cs["boe"],
+            term_years           = cs["term"],
+            expenses             = cs["expenses"],
+            deposit_raw          = cs["r"]["deposit_raw"] + xdep,
+        )
+        self._render_results(r_adj, cs["term"], cs["pension"], cs["income_items"])
+
+    # ---- Calculate ----
+
+    def _calc(self):
         try:
-            income  = self._flt("income")
-            bonus   = self._flt("bonus")
-            pension = self._flt("pension", pct=True)
-            lodger  = self._flt("lodger")
-            price   = self._flt("price")
-            overbid = self._flt("overbid", pct=True)
-            fees    = self._flt("fees")
-            term    = int(self._flt("term"))
-            boe     = self._flt("boe", pct=True)
-            expenses = {k: float(v.get() or 0) for k, v in self._expense_vars.items()}
+            self._save_to_db()
         except ValueError:
             messagebox.showerror("Error", "Invalid input — check all fields are numbers.")
             return
 
+        income  = self._parse_fixed("income")
+        bonus   = self._parse_fixed("bonus")
+        pension = self._parse_fixed("pension", pct=True)
+        price   = self._parse_fixed("price")
+        overbid = self._parse_fixed("overbid", pct=True)
+        fees    = self._parse_fixed("fees")
+        term    = int(self._parse_fixed("term") or 25)
+        boe     = self._parse_fixed("boe", pct=True)
+
+        if self._deposit_mode.get() == "custom":
+            dep_raw = self._deposit_custom_var.get()
+            if dep_raw == "e.g. 20 000":
+                dep_raw = ""
+            dep_raw = dep_raw.replace(",", "").replace("£", "").replace(" ", "").strip()
+            deposit_override = float(dep_raw) if dep_raw else 0.0
+            deposit_category = None
+        else:
+            deposit_override = None
+            deposit_category = self._deposit_cat_var.get() or "Deposit"
+
+        income_items  = []
+        for item in self._income_items:
+            lbl, amt = self._read_dynamic_item(item)
+            income_items.append((lbl, amt))
+        extra_monthly = sum(amt for _, amt in income_items)
+
+        expenses = {}
+        for item in self._expense_items:
+            lbl, amt = self._read_dynamic_item(item)
+            if lbl:
+                expenses[lbl] = amt
+
         r = db.mortgage_estimate(
             annual_income=income, bonus=bonus, pension_pct=pension,
-            lodger_monthly=lodger, property_price=price, overbid_rate=overbid,
+            extra_monthly_income=extra_monthly,
+            property_price=price, overbid_rate=overbid,
             fees=fees, boe_rate=boe, term_years=term, expenses=expenses,
+            deposit_raw=deposit_override, deposit_category=deposit_category or "Deposit",
         )
 
-        rf = self._results
+        # Store state so what-if sliders can recompute without re-reading DB
+        self._calc_state = {
+            "r": r, "income": income, "bonus": bonus, "pension": pension,
+            "boe": boe, "term": term, "extra_monthly": extra_monthly,
+            "expenses": expenses, "income_items": income_items,
+            "price": price, "overbid": overbid,
+        }
 
-        # ---- Income summary ----
-        section_label(rf, "Income").pack(anchor="w", pady=(8, 4))
-        income_rows = [
-            ("Gross taxable income",  fmt_gbp(r["gross_taxable"]),      FG),
-            ("Net annual salary",     fmt_gbp(r["net_annual"]),         GREEN),
-            ("Net monthly salary",    fmt_gbp(r["net_monthly"]),        GREEN),
-            ("Lodger income",         fmt_gbp(r["lodger_monthly"]) + "/mo", ACCENT),
-            ("Total net monthly",     fmt_gbp(r["total_net_monthly"]),  ACCENT),
-        ]
-        self._result_table(rf, income_rows)
+        # Update slider range and reset to zero (suppress trace during reset)
+        wi_max_dep = min(max(50_000, int(max(0, r["mortgage_amount"] - r["est_borrow_45x"])) + 50_000), 500_000)
+        self._wi_updating = True
+        self._wi_dep_scale.config(to=wi_max_dep)
+        self._wi_dep_var.set(0)
+        self._wi_sal_var.set(0)
+        self._wi_dep_lbl.config(text="£0")
+        self._wi_sal_lbl.config(text="£0")
+        self._wi_updating = False
 
-        # ---- Deposit ----
-        section_label(rf, "Deposit").pack(anchor="w", pady=(12, 4))
-        dep_rows = [
-            ("Available deposit (from accounts)", fmt_gbp(r["deposit_raw"]),    FG),
-            ("Over-bid amount",                   fmt_gbp(-r["overbid_amount"]), RED),
-            ("Fees & moving costs",               fmt_gbp(-r["fees"]),           RED),
-            ("Deposit after costs",               fmt_gbp(r["deposit_after"]),   GREEN),
-        ]
-        self._result_table(rf, dep_rows)
+        self._render_results(r, term, pension, income_items)
 
-        # ---- Mortgage ----
-        section_label(rf, "Mortgage").pack(anchor="w", pady=(12, 4))
-        surplus_colour = GREEN if r["monthly_surplus"] >= 0 else RED
-        surplus_label  = "Monthly surplus" if r["monthly_surplus"] >= 0 else "Monthly shortfall"
-        mort_rows = [
-            ("Property price",      fmt_gbp(r["property_price"]),   FG),
-            ("Mortgage amount",     fmt_gbp(r["mortgage_amount"]),  FG),
-            ("LTV",                 fmt_pct(r["ltv"]),              YELLOW),
-            ("Interest rate",       fmt_pct(r["interest_rate"]),    YELLOW),
-            ("Monthly repayment",   fmt_gbp(r["monthly_mortgage"]), RED),
-            ("Est. borrow (4.5x salary)", fmt_gbp(r["est_borrow_45x"]), ACCENT),
-            ("Remaining vs. est.",  fmt_gbp(r["remaining_vs_est"]),
-             RED if r["remaining_vs_est"] > 0 else GREEN),
-            (surplus_label,         fmt_gbp(abs(r["monthly_surplus"])), surplus_colour),
-        ]
-        self._result_table(rf, mort_rows)
+    def _render_results(self, r, term, pension, income_items):
+        for w in self._results.winfo_children():
+            w.destroy()
 
-        if r["salary_required"] is not None:
-            req = r["salary_required"] / (1 - pension)  # back to gross
-            tk.Label(rf, text=f"  ⚠  Salary needed to break even: {fmt_gbp(req)} gross/yr",
-                     bg=BG, fg=YELLOW, font=STYLE["font_bold"]).pack(anchor="w", pady=2)
+        if self._results_fig is not None:
+            try:
+                plt.close(self._results_fig)
+            except Exception:
+                pass
+            self._results_fig = None
 
-        # ---- Next LTV band ----
-        section_label(rf, "Next LTV Band").pack(anchor="w", pady=(12, 4))
-        ltv_rows = [
-            ("Next band target",         r["next_ltv_label"],                    FG),
-            ("Additional deposit needed", fmt_gbp(r["additional_deposit"]),      ACCENT),
-            ("Rate at next band",         fmt_pct(r["next_ltv_rate"]),           YELLOW),
-            ("Monthly saving vs now",
-             fmt_gbp(r["monthly_mortgage"] - r["next_ltv_monthly"]),             GREEN),
-        ]
-        self._result_table(rf, ltv_rows)
+        rf          = self._results
+        surplus     = r["monthly_surplus"]
+        surplus_c   = GREEN if surplus >= 0 else RED
+        surplus_lbl = "Surplus" if surplus >= 0 else "Shortfall"
 
-        # ---- Monthly budget breakdown ----
-        section_label(rf, "Monthly Budget").pack(anchor="w", pady=(12, 4))
-        budget_rows = [("Net income + lodger", fmt_gbp(r["total_net_monthly"]), GREEN)]
-        budget_rows += [(f"  {k}", fmt_gbp(-v), RED) for k, v in r["expenses"].items()]
-        budget_rows += [("  Mortgage",         fmt_gbp(-r["monthly_mortgage"]), RED)]
-        budget_rows += [(surplus_label,        fmt_gbp(abs(r["monthly_surplus"])), surplus_colour)]
-        self._result_table(rf, budget_rows)
+        def div(pady=(8, 0)):
+            tk.Frame(rf, bg=BG3, height=1).pack(fill="x", pady=pady)
 
-        tk.Label(rf, text="⚠  Estimates only. Lenders assess affordability individually.",
-                 bg=BG, fg=SUBTEXT, font=STYLE["font"], wraplength=500,
-                 justify="left").pack(anchor="w", pady=(12, 4))
+        def stat_card(parent, title, value, col, sub="", sub_col=None):
+            f = tk.Frame(parent, bg=BG3, padx=12, pady=8)
+            tk.Frame(f, bg=BG3, width=140, height=1).pack()
+            tk.Label(f, text=title, bg=BG3, fg=SUBTEXT, font=STYLE["font"],
+                     anchor="w").pack(fill="x")
+            tk.Label(f, text=value, bg=BG3, fg=col,
+                     font=("Segoe UI", 15, "bold"), anchor="w").pack(fill="x")
+            tk.Label(f, text=sub, bg=BG3, fg=sub_col or SUBTEXT, font=STYLE["font"],
+                     anchor="w").pack(fill="x")
+            return f
 
-    def _result_table(self, parent, rows):
-        """Render a list of (label, value, colour) rows as a compact table."""
-        for label, value, colour in rows:
-            row = styled_frame(parent)
+        def brow(parent, label, val, col, bold=False):
+            row = tk.Frame(parent, bg=BG)
             row.pack(fill="x", pady=1)
             tk.Label(row, text=label, bg=BG, fg=SUBTEXT, font=STYLE["font"],
-                     width=30, anchor="w").pack(side="left")
-            tk.Label(row, text=value, bg=BG, fg=colour,
-                     font=STYLE["font_mono"], anchor="e").pack(side="left", padx=8)
+                     width=24, anchor="w").pack(side="left")
+            tk.Label(row, text=val, bg=BG, fg=col,
+                     font=STYLE["font_bold"] if bold else STYLE["font_mono"],
+                     anchor="e").pack(side="left", padx=4)
+
+        # ── Hero cards ────────────────────────────────────────────────────
+        cards = tk.Frame(rf, bg=BG)
+        cards.pack(fill="x", pady=(10, 6), padx=2)
+        for col in range(3):
+            cards.columnconfigure(col, weight=1, uniform="hero")
+
+        monthly_saving = r["monthly_mortgage"] - r["next_ltv_monthly"]
+        stat_card(cards, "Monthly Payment",       fmt_gbp(r["monthly_mortgage"]),
+                  RED,   f"over {term} yrs  ·  {fmt_pct(r['interest_rate'])} rate"
+                  ).grid(row=0, column=0, padx=4, pady=4, sticky="nsew")
+        stat_card(cards, "LTV",                   fmt_pct(r["ltv"]),
+                  YELLOW, f"mortgage {fmt_gbp(r['mortgage_amount'])}"
+                  ).grid(row=0, column=1, padx=4, pady=4, sticky="nsew")
+        stat_card(cards, surplus_lbl,             fmt_gbp(abs(surplus)),
+                  surplus_c, "per month after all costs"
+                  ).grid(row=0, column=2, padx=4, pady=4, sticky="nsew")
+        stat_card(cards, "Net Monthly Income",    fmt_gbp(r["total_net_monthly"]),
+                  GREEN,  f"net annual {fmt_gbp(r['net_annual'])}"
+                  ).grid(row=1, column=0, padx=4, pady=4, sticky="nsew")
+        stat_card(cards, "Deposit (after costs)", fmt_gbp(r["deposit_after"]),
+                  ACCENT, f"{fmt_gbp(r['deposit_raw'])} available"
+                  ).grid(row=1, column=1, padx=4, pady=4, sticky="nsew")
+        stat_card(cards, "Est. Max Borrow",       fmt_gbp(r["est_borrow_45x"]),
+                  ACCENT, "4.5× salary guideline"
+                  ).grid(row=1, column=2, padx=4, pady=4, sticky="nsew")
+
+        # ── Salary warning banner ─────────────────────────────────────────
+        if r["salary_required"] is not None:
+            req = r["salary_required"] / (1 - pension) if pension < 1 else r["salary_required"]
+            warn = tk.Frame(rf, bg="#2d2010", padx=14, pady=8)
+            warn.pack(fill="x", pady=(0, 4), padx=2)
+            tk.Label(warn, text=f"⚠  To break even you'd need {fmt_gbp(req)} gross/yr",
+                     bg="#2d2010", fg=YELLOW, font=STYLE["font_bold"]).pack(anchor="w")
+
+        div()
+
+        # ── Property & LTV bar ────────────────────────────────────────────
+        section_label(rf, "Property  &  LTV").pack(anchor="w", pady=(8, 4))
+
+        ltv_c = tk.Canvas(rf, bg=BG, height=70, highlightthickness=0)
+        ltv_c.pack(fill="x", padx=2, pady=(0, 6))
+
+        _C_DEP  = "#2d7a4f"
+        _C_BORR = "#7a6500"
+        _C_SHRT = "#8a2020"
+        _C_OVER = "#1e6b68"
+        _C_FEES = "#5a2d8a"
+
+        def _draw_ltv(_=None):
+            ltv_c.delete("all")
+            w = ltv_c.winfo_width()
+            if w < 20:
+                return
+            price = r["property_price"]
+            if price <= 0:
+                ltv_c.create_text(w // 2, 35, fill=SUBTEXT, font=STYLE["font"],
+                                  text="Enter a property price to see the breakdown")
+                return
+            dep        = max(0.0, r["deposit_after"])
+            mort       = max(0.0, r["mortgage_amount"])
+            can_borrow = min(mort, r["est_borrow_45x"])
+            shortfall  = max(0.0, mort - r["est_borrow_45x"])
+            overbid    = r["overbid_amount"]
+            fees_v     = r["fees"]
+            total_cost = price + overbid + fees_v
+            scale      = w / total_cost
+            segs = [
+                (dep,        _C_DEP,  "Deposit",    fmt_gbp(dep)),
+                (can_borrow, _C_BORR, "Can borrow", fmt_gbp(can_borrow)),
+                (shortfall,  _C_SHRT, "Shortfall",  fmt_gbp(shortfall)),
+                (overbid,    _C_OVER, "Over-bid",   fmt_gbp(overbid)),
+                (fees_v,     _C_FEES, "Fees",       fmt_gbp(fees_v)),
+            ]
+            BAR_Y1, BAR_Y2 = 14, 36
+            x = 0
+            seg_rects = []
+            for i, (val, col, lbl, val_text) in enumerate(segs):
+                px = int(val * scale) if i < len(segs) - 1 else w - x
+                if px > 0:
+                    ltv_c.create_rectangle(x, BAR_Y1, x + px, BAR_Y2, fill=col, outline="")
+                seg_rects.append((x, x + px, col, lbl, val_text))
+                x += px
+            ltv_c.create_text(w, 2, anchor="ne", fill=FG, font=STYLE["font"],
+                              text=f"Total cost  {fmt_gbp(total_cost)}")
+            for x0, x1, col, lbl, val_text in seg_rects:
+                seg_w = x1 - x0
+                cx = (x0 + x1) // 2
+                if seg_w >= 110:
+                    ltv_c.create_text(cx, 44, anchor="center", fill=col,
+                                      font=STYLE["font"], text=f"{lbl}  {val_text}")
+                elif seg_w >= 52:
+                    ltv_c.create_text(cx, 44, anchor="center", fill=col,
+                                      font=STYLE["font"], text=val_text)
+            x_leg = 0
+            for _, col, lbl, _ in segs:
+                ltv_c.create_rectangle(x_leg, 57, x_leg + 10, 66, fill=col, outline="")
+                ltv_c.create_text(x_leg + 14, 61, anchor="w", fill=SUBTEXT,
+                                  font=STYLE["font"], text=lbl)
+                x_leg += 90
+
+        ltv_c.bind("<Configure>", _draw_ltv)
+        ltv_c.after(20, _draw_ltv)
+
+        if r["additional_deposit"] > 0:
+            nudge = tk.Frame(rf, bg=BG2, padx=12, pady=6)
+            nudge.pack(fill="x", padx=2, pady=(0, 4))
+            tk.Label(nudge, text="Next LTV band:", bg=BG2, fg=SUBTEXT,
+                     font=STYLE["font"]).pack(side="left")
+            tk.Label(nudge, text=f"  {r['next_ltv_label']}  ", bg=BG2, fg=YELLOW,
+                     font=STYLE["font_bold"]).pack(side="left")
+            tk.Label(nudge, text=f"add {fmt_gbp(r['additional_deposit'])} deposit  →  save ",
+                     bg=BG2, fg=SUBTEXT, font=STYLE["font"]).pack(side="left")
+            tk.Label(nudge, text=f"{fmt_gbp(monthly_saving)}/mo",
+                     bg=BG2, fg=GREEN, font=STYLE["font_bold"]).pack(side="left")
+
+        div()
+
+        # ── Monthly Budget: donut + breakdown ─────────────────────────────
+        section_label(rf, "Monthly Budget").pack(anchor="w", pady=(8, 4))
+        budget_outer = tk.Frame(rf, bg=BG)
+        budget_outer.pack(fill="x", padx=2)
+
+        slices, colours_d = [], []
+        slice_palette = ["#4a5568", "#5a6578", "#3a4558", "#6a7588",
+                         "#2a3548", "#7a8598", "#525f72", "#404e62"]
+        pal_i = 0
+        for k, v in r["expenses"].items():
+            if v > 0:
+                slices.append((k, v))
+                colours_d.append(slice_palette[pal_i % len(slice_palette)])
+                pal_i += 1
+        slices.append(("Mortgage", r["monthly_mortgage"]))
+        colours_d.append(RED)
+        if surplus > 0:
+            slices.append((surplus_lbl, surplus))
+            colours_d.append(GREEN)
+
+        fig = Figure(figsize=(3.2, 3.2), facecolor=BG)
+        self._results_fig = fig
+        ax = fig.add_subplot(111, facecolor=BG)
+        fig.subplots_adjust(0, 0, 1, 1)
+        sizes = [s[1] for s in slices]
+        if sum(sizes) > 0:
+            ax.pie(sizes, colors=colours_d, startangle=90,
+                   wedgeprops=dict(width=0.48, edgecolor=BG, linewidth=1.5))
+        ax.text(0,  0.10, fmt_gbp(r["total_net_monthly"]),
+                ha="center", va="center", fontsize=9, color=FG, fontweight="bold",
+                fontfamily="monospace")
+        ax.text(0, -0.18, "monthly in",
+                ha="center", va="center", fontsize=7, color=SUBTEXT)
+        ax.set_aspect("equal")
+        cw = embed_figure(budget_outer, fig)
+        cw.pack(side="left", padx=(0, 12))
+
+        tbl = tk.Frame(budget_outer, bg=BG)
+        tbl.pack(side="left", fill="both", expand=True, pady=4)
+        brow(tbl, "Net income", fmt_gbp(r["total_net_monthly"]), GREEN, bold=True)
+        for name, amt in income_items:
+            if name and amt:
+                brow(tbl, f"  + {name}", fmt_gbp(amt), ACCENT)
+        tk.Frame(tbl, bg=BG3, height=1).pack(fill="x", pady=3)
+        for k, v in r["expenses"].items():
+            brow(tbl, f"  − {k}", fmt_gbp(v), SUBTEXT)
+        brow(tbl, "  − Mortgage", fmt_gbp(r["monthly_mortgage"]), RED)
+        tk.Frame(tbl, bg=BG3, height=1).pack(fill="x", pady=3)
+        brow(tbl, surplus_lbl, fmt_gbp(abs(surplus)), surplus_c, bold=True)
+
+        div(pady=(10, 0))
+
+        # ── Income breakdown ──────────────────────────────────────────────
+        section_label(rf, "Income Breakdown").pack(anchor="w", pady=(8, 4))
+        brow(rf, "Gross (salary + bonus)", fmt_gbp(r["gross_taxable"]),    FG)
+        brow(rf, "Net annual",             fmt_gbp(r["net_annual"]),       GREEN)
+        brow(rf, "Net monthly salary",     fmt_gbp(r["net_monthly"]),      GREEN)
+        for name, amt in income_items:
+            if name and amt:
+                brow(rf, f"  + {name}", fmt_gbp(amt) + "/mo", ACCENT)
+        brow(rf, "Total net monthly",      fmt_gbp(r["total_net_monthly"]), GREEN, bold=True)
+
+        div(pady=(10, 4))
+        tk.Label(rf, text="⚠  Estimates only. Lenders assess affordability individually.",
+                 bg=BG, fg=SUBTEXT, font=STYLE["font"], wraplength=480,
+                 justify="left").pack(anchor="w", pady=(0, 8))
 
 
 # ---------------------------------------------------------------------------
@@ -2197,90 +2869,6 @@ class BaseDialog(tk.Toplevel):
         return self._fields[label].get().strip()
 
 
-class AddAccountDialog(BaseDialog):
-    def __init__(self, parent, on_done):
-        super().__init__(parent, "Add Account")
-        self._on_done = on_done
-        self._build()
-
-    def _build(self):
-        f = styled_frame(self)
-        f.pack(padx=24, pady=16)
-
-        styled_label(f, 'Name is auto-generated as  "Bank - Account label"',
-                     fg=SUBTEXT).pack(pady=(0, 10), anchor="w")
-
-        # Bank
-        self._field(f, "Bank:")
-
-        # Account label (used in name, e.g. "Current", "Flex Saver")
-        self._field(f, "Account label:")
-
-        # Live name preview
-        self._preview = styled_label(f, "", fg=ACCENT, font=STYLE["font_bold"])
-        self._preview.pack(pady=(4, 10), anchor="w")
-        for key in ("Bank:", "Account label:"):
-            self._fields[key].trace_add("write", lambda *_: self._update_preview())
-
-        # Account product type (configurable list)
-        tk.Frame(f, bg=BG, height=1).pack(fill="x", pady=(0, 8))
-        styled_label(f, "Account type  (Cash, LISA, S&S ISA, etc.):").pack(anchor="w", pady=(0, 4))
-
-        type_row = styled_frame(f)
-        type_row.pack(fill="x", pady=(0, 4))
-        self._pt_var = tk.StringVar()
-        self._pt_combo = ttk.Combobox(type_row, textvariable=self._pt_var, width=22,
-                                       font=STYLE["font"], state="normal")
-        self._pt_combo["values"] = db.get_product_types()
-        self._pt_combo.pack(side="left")
-        styled_button(type_row, "+ New type", self._add_product_type,
-                      color=YELLOW).pack(side="left", padx=(8, 0))
-
-        styled_button(f, "Add Account", self._save, color=GREEN).pack(pady=(16, 4), anchor="e")
-
-    def _update_preview(self):
-        bank  = self._fields["Bank:"].get().strip()
-        label = self._fields["Account label:"].get().strip()
-        name  = f"{bank} - {label}" if bank and label else (bank or label)
-        self._preview.config(text=f"→  {name}" if name else "")
-
-    def _add_product_type(self):
-        name = simpledialog.askstring("New Account Type",
-                                      "Enter new account type name:",
-                                      parent=self)
-        if name and name.strip():
-            db.add_product_type(name.strip())
-            self._pt_combo["values"] = db.get_product_types()
-            self._pt_var.set(name.strip())
-
-    def _save(self):
-        bank  = self._val("Bank:").strip()
-        label = self._val("Account label:").strip()
-        ptype = self._pt_var.get().strip()
-        if not bank:
-            messagebox.showerror("Error", "Bank is required.")
-            return
-        if not label:
-            messagebox.showerror("Error", "Account label is required.")
-            return
-        account_name = f"{bank} - {label}"
-        # If user typed a brand-new product type, persist it
-        if ptype and ptype not in db.get_product_types():
-            db.add_product_type(ptype)
-        db.upsert_account(
-            account_name=account_name,
-            bank=bank,
-            account_type=label,
-            category=None,
-            max_balance_for_rate=None,
-            interest_rate=0.0,
-            allocations={},
-            effective_from=datetime.date.today().isoformat(),
-            note=None,
-            product_type=ptype or None,
-        )
-        self._on_done()
-        self.destroy()
 
 
 # ---------------------------------------------------------------------------
@@ -2471,6 +3059,9 @@ class IncomeTab(tk.Frame):
             return
         idx = int(round(event.xdata)) if event.xdata is not None else -1
         if 0 <= idx < len(self._month_list):
+            if self._month_list[idx] == self._sel_month:
+                self._clear_drill()
+                return
             self._sel_month = self._month_list[idx]
             try:
                 display = datetime.datetime.strptime(
@@ -2642,13 +3233,19 @@ class FinanceApp(tk.Tk):
             "dashboard":  DashboardTab(self.container),
             "snapshot":   SnapshotTab(self.container),
             "history":    HistoryTab(self.container),
-            "categories": CategoriesTab(self.container),
+            "categories": CategoriesTab(self.container,
+                                         on_change=self._on_categories_changed),
             "income":     IncomeTab(self.container),
             "interest":   InterestTab(self.container),
             "mortgage":   MortgageTab(self.container),
             "calced":     CalcedBalancesTab(self.container),
             "settings":   SettingsTab(self.container),
         }
+
+    def _on_categories_changed(self):
+        self._tabs["dashboard"].rebuild()
+        self._tabs["snapshot"].rebuild()
+        self._tabs["mortgage"].refresh_categories()
 
     def _show_tab(self, key):
         for k, tab in self._tabs.items():

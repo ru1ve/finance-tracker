@@ -170,6 +170,29 @@ def init_db():
             );
         """)
 
+    # Mortgage persistence tables
+    with get_conn() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS mortgage_fixed (
+                key   TEXT PRIMARY KEY,
+                value REAL NOT NULL DEFAULT 0.0
+            );
+
+            CREATE TABLE IF NOT EXISTS mortgage_income_items (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                label      TEXT NOT NULL DEFAULT '',
+                amount     REAL NOT NULL DEFAULT 0.0,
+                sort_order INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS mortgage_expense_items (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                label      TEXT NOT NULL DEFAULT '',
+                amount     REAL NOT NULL DEFAULT 0.0,
+                sort_order INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+
 
 def get_setting(key: str, default: str | None = None) -> str | None:
     with get_conn() as conn:
@@ -302,6 +325,26 @@ def update_account_category(account_id: int, category):
 def reactivate_account(account_id: int):
     with get_conn() as conn:
         conn.execute("UPDATE accounts SET is_active=1 WHERE id=?", (account_id,))
+
+
+def get_spending_categories() -> list:
+    """Returns [{'id': ..., 'name': ...}] in display order."""
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT id, name FROM spending_categories ORDER BY id"
+        ).fetchall()]
+
+
+def add_spending_category(name: str) -> None:
+    with get_conn() as conn:
+        conn.execute("INSERT OR IGNORE INTO spending_categories (name) VALUES (?)", (name,))
+
+
+def delete_spending_category(category_id: int) -> None:
+    """Delete a category and all account allocations that reference it."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM account_allocations WHERE category_id=?", (category_id,))
+        conn.execute("DELETE FROM spending_categories WHERE id=?", (category_id,))
 
 
 def get_spending_category_names() -> list:
@@ -894,6 +937,77 @@ def project_balances(months: int):
 
 
 # ---------------------------------------------------------------------------
+# Mortgage persistence helpers
+# ---------------------------------------------------------------------------
+
+def get_category_current_total(category_name: str) -> float:
+    """Sum the current allocated amount for one category across all active accounts."""
+    snapshot = get_latest_balance_per_account()
+    accounts = get_all_accounts()
+    today    = datetime.date.today().isoformat()
+    total    = 0.0
+    for acc in accounts:
+        acc_id  = acc["id"]
+        balance = snapshot.get(acc_id, 0.0)
+        allocs  = get_allocations_on_date(acc_id, today)
+        amounts = calc_category_amounts(balance, allocs)
+        total  += amounts.get(category_name, 0.0)
+    return total
+
+
+def get_mortgage_fixed() -> dict:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT key, value FROM mortgage_fixed").fetchall()
+    return {r["key"]: r["value"] for r in rows}
+
+
+def save_mortgage_fixed(data: dict) -> None:
+    with get_conn() as conn:
+        for key, value in data.items():
+            conn.execute(
+                "INSERT INTO mortgage_fixed (key, value) VALUES (?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+
+
+def get_mortgage_income_items() -> list:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT label, amount FROM mortgage_income_items ORDER BY sort_order, id"
+        ).fetchall()
+    return [{"label": r["label"], "amount": r["amount"]} for r in rows]
+
+
+def save_mortgage_income_items(items: list) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM mortgage_income_items")
+        for i, item in enumerate(items):
+            conn.execute(
+                "INSERT INTO mortgage_income_items (label, amount, sort_order) VALUES (?,?,?)",
+                (item["label"], item["amount"], i),
+            )
+
+
+def get_mortgage_expense_items() -> list:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT label, amount FROM mortgage_expense_items ORDER BY sort_order, id"
+        ).fetchall()
+    return [{"label": r["label"], "amount": r["amount"]} for r in rows]
+
+
+def save_mortgage_expense_items(items: list) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM mortgage_expense_items")
+        for i, item in enumerate(items):
+            conn.execute(
+                "INSERT INTO mortgage_expense_items (label, amount, sort_order) VALUES (?,?,?)",
+                (item["label"], item["amount"], i),
+            )
+
+
+# ---------------------------------------------------------------------------
 # Mortgage calculator — mirrors the Mortgage sheet logic exactly
 # ---------------------------------------------------------------------------
 
@@ -978,38 +1092,37 @@ def calc_salary_required(shortfall_annual: float, bonus: float,
 
 def mortgage_estimate(
     annual_income: float,
-    bonus: float = 605.0,
-    pension_pct: float = 0.06,
-    lodger_monthly: float = 525.0,
-    property_price: float = 200000.0,
-    overbid_rate: float = 0.05,
-    fees: float = 5000.0,
-    boe_rate: float = 0.0375,
-    term_years: int = 20,
+    bonus: float = 0.0,
+    pension_pct: float = 0.0,
+    extra_monthly_income: float = 0.0,
+    property_price: float = 0.0,
+    overbid_rate: float = 0.0,
+    fees: float = 0.0,
+    boe_rate: float = 0.0,
+    term_years: int = 25,
     expenses: dict = None,
+    deposit_raw: float | None = None,
+    deposit_category: str = "Deposit",
 ):
     """
     Full mortgage affordability calculation matching the Mortgage sheet.
 
+    extra_monthly_income: sum of all dynamic monthly income items (lodger etc.)
     expenses: dict of {label: monthly_amount} for the monthly outgoings table.
-              Defaults to the values from the spreadsheet.
+    deposit_raw: if provided, use this directly as the deposit amount.
+                 If None, sum accounts in deposit_category.
     """
     if expenses is None:
-        expenses = {
-            "Food + Essentials": 350.0,
-            "Fun":               500.0,
-            "Utility":            80.0,
-            "Wifi":               25.0,
-            "Holidays":          250.0,
-            "Savings":           250.0,
-            "Home Insurance":     25.0,
-            "Transport + Car":   150.0,
-            "Council Tax Band C":200.0,
-            "AI":                 20.0,
-            "Monzo Max":          17.0,
-            "Climbing Gym":       39.0,
-            "Emergency Fund":    200.0,
-        }
+        expenses = {}
+
+    # Clamp inputs so arithmetic stays sane
+    annual_income = max(0.0, annual_income)
+    bonus         = max(0.0, bonus)
+    pension_pct   = max(0.0, min(0.99, pension_pct))
+    property_price = max(0.0, property_price)
+    overbid_rate  = max(0.0, min(1.0, overbid_rate))
+    fees          = max(0.0, fees)
+    term_years    = max(1, term_years)
 
     # --- Income ---
     gross = (annual_income + bonus) * (1 - pension_pct)
@@ -1017,16 +1130,17 @@ def mortgage_estimate(
     net_monthly = net_annual / 12
 
     # --- Deposit ---
-    snapshot = get_latest_balance_per_account()
-    accounts = get_all_accounts()
-    today = datetime.date.today().isoformat()
-    deposit_raw = 0.0
-    for acc in accounts:
-        acc_id = acc["id"]
-        balance = snapshot.get(acc_id, 0.0)
-        allocs = get_allocations_on_date(acc_id, today)
-        amounts = calc_category_amounts(balance, allocs)
-        deposit_raw += amounts.get("Deposit", 0.0)
+    if deposit_raw is None:
+        snapshot = get_latest_balance_per_account()
+        accounts = get_all_accounts()
+        today = datetime.date.today().isoformat()
+        deposit_raw = 0.0
+        for acc in accounts:
+            acc_id = acc["id"]
+            balance = snapshot.get(acc_id, 0.0)
+            allocs = get_allocations_on_date(acc_id, today)
+            amounts = calc_category_amounts(balance, allocs)
+            deposit_raw += amounts.get(deposit_category, 0.0)
 
     overbid_amount   = property_price * overbid_rate
     deposit_after    = deposit_raw - overbid_amount - fees
@@ -1040,8 +1154,7 @@ def mortgage_estimate(
 
     # --- Monthly budget ---
     total_expenses   = sum(expenses.values()) + monthly_mortgage
-    # Net income includes lodger
-    total_net_monthly = net_monthly + lodger_monthly
+    total_net_monthly = net_monthly + extra_monthly_income
     gross_income_remaining = total_net_monthly - total_expenses  # positive = surplus
 
     # --- Next LTV band ---
@@ -1070,9 +1183,9 @@ def mortgage_estimate(
         # Income
         "gross_taxable":       gross,
         "net_annual":          net_annual,
-        "net_monthly":         net_monthly,
-        "lodger_monthly":      lodger_monthly,
-        "total_net_monthly":   total_net_monthly,
+        "net_monthly":            net_monthly,
+        "extra_monthly_income":   extra_monthly_income,
+        "total_net_monthly":      total_net_monthly,
         # Deposit
         "deposit_raw":         deposit_raw,
         "overbid_amount":      overbid_amount,
