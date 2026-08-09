@@ -299,15 +299,25 @@ def deactivate_account(account_id):
 
 def update_account_details(account_id: int, bank: str | None, account_type: str | None,
                            account_name: str, product_type: str | None,
-                           max_balance_for_rate: float | None):
+                           max_balance_for_rate: float | None,
+                           category: str | None = None):
     """Update the core editable fields on an account row."""
     with get_conn() as conn:
         conn.execute(
             "UPDATE accounts SET bank=?, account_type=?, account_name=?,"
-            " product_type=?, max_balance_for_rate=? WHERE id=?",
+            " product_type=?, max_balance_for_rate=?, category=? WHERE id=?",
             (bank or None, account_type or None, account_name,
-             product_type or None, max_balance_for_rate, account_id),
+             product_type or None, max_balance_for_rate, category or None, account_id),
         )
+
+
+def get_account_categories() -> list:
+    """Returns distinct non-null category values currently stored on accounts."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT category FROM accounts WHERE category IS NOT NULL ORDER BY category"
+        ).fetchall()
+    return [r["category"] for r in rows]
 
 
 def update_account_product_type(account_id: int, product_type):

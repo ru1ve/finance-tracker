@@ -1,6 +1,6 @@
 """
 import_data.py — One-time migration from the exported spreadsheet JSON.
-Run this once before launching app.py.
+Run this once before launching app_old.py.
 
 Usage:
     python import_data.py [path/to/Finance.xlsx]
@@ -105,7 +105,7 @@ def main():
     tmp.unlink()
 
     print(f"Imported: {n_acc} accounts, {n_snap} snapshots → finance.db")
-    print("Done. You can now run:  python app.py")
+    print("Done. You can now run:  python app_old.py")
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ pip install -r requirements.txt
 ### 2. Run the app
 
 ```bash
-python app.py
+python app_old.py
 ```
 
 `finance.db` is created automatically on first run in the same folder as `app.py`.
