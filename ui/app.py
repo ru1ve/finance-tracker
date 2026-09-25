@@ -11,6 +11,7 @@ from ui.tabs.dashboard      import DashboardTab
 from ui.tabs.snapshot       import SnapshotTab
 from ui.tabs.history        import HistoryTab
 from ui.tabs.interest       import InterestTab
+from ui.tabs.spending       import SpendingTab
 from ui.tabs.mortgage       import MortgageTab
 from ui.tabs.calced_balances import CalcedBalancesTab
 from ui.tabs.settings       import SettingsTab
@@ -169,6 +170,7 @@ class FinanceApp(tk.Tk):
             ("dashboard",  "\U0001f4ca  Dashboard"),
             ("snapshot",   "\U0001f4dd  Log Snapshot"),
             ("history",    "\U0001f4c8  History"),
+            ("spending",   "\U0001f4b7  Spending"),
             ("mortgage",   "\U0001f3e0  Mortgage"),
             ("calced",     "\U0001f5c3   Rec. Balances"),
             ("settings",   "⚙   Settings"),
@@ -230,6 +232,7 @@ class FinanceApp(tk.Tk):
                                        on_open_interest=self._open_interest),
             "snapshot":   SnapshotTab(self.container),
             "history":    HistoryTab(self.container),
+            "spending":   SpendingTab(self.container),
             "mortgage":   MortgageTab(self.container),
             "calced":     CalcedBalancesTab(self.container),
             "settings":   SettingsTab(self.container),
